@@ -1,0 +1,17 @@
+{
+  "name": "aida-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "NODE_ENV=development DEV_RETURN_OTP=1 node --watch src/server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sesv2": "^3.926.0",
+    "livekit-server-sdk": "^2.19.1",
+    "ws": "^8.18.3"
+  }
+}
