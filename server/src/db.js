@@ -120,6 +120,10 @@ export function openDatabase(path) {
     db.exec("ALTER TABLE messages ADD COLUMN topic_id TEXT NOT NULL DEFAULT 'general'");
   }
   db.exec('CREATE INDEX IF NOT EXISTS messages_by_topic ON messages(pair_id, topic_id, id)');
+  // Additive migration: replies reference an earlier message in the same pair and topic.
+  if (!messageColumns.some(column => column.name === 'reply_to_id')) {
+    db.exec('ALTER TABLE messages ADD COLUMN reply_to_id INTEGER');
+  }
   return db;
 }
 

@@ -362,3 +362,70 @@ test('delivery and read receipts advance independently, survive reconnects, and 
     assert.deepEqual(await receipts(), { deliveredThrough: 0, readThrough: 0 });
   } finally { live.ws.terminate(); }
 });
+
+test('replies quote a message from the same topic and connection', async t => {
+  const f = await fixture(t);
+  const alice = await f.login('reply-a@example.com');
+  const bob = await f.login('reply-b@example.com');
+  const invite = (await f.request('/v1/invites', { method: 'POST', token: alice })).value;
+  const pairId = (await f.request('/v1/invites/accept', { method: 'POST', token: bob,
+    body: { code: invite.code } })).value.pair.id;
+  const topic = (await f.request('/v1/topics', { method: 'POST', token: alice,
+    body: { name: 'Plans', pairId } })).value;
+  const original = (await f.request('/v1/messages', { method: 'POST', token: alice,
+    body: { text: 'Dinner at eight?', clientId: 'reply-original-1', pairId } })).value;
+  const photo = (await f.request('/v1/media', { method: 'POST', token: alice, body: new Uint8Array([1, 2, 3]),
+    headers: { 'content-type': 'image/png', 'x-pair-id': pairId } })).value;
+
+  const reply = await f.request('/v1/messages', { method: 'POST', token: bob,
+    body: { text: 'Perfect', clientId: 'reply-answer-1', pairId, replyToId: original.id } });
+  assert.equal(reply.status, 201);
+  assert.equal(reply.value.replyToId, original.id);
+  assert.deepEqual(reply.value.replyTo,
+    { id: original.id, senderId: original.senderId, kind: 'text', text: 'Dinner at eight?' });
+
+  // Replies survive listing, single fetch, and idempotent resend.
+  const listed = (await f.request('/v1/messages?topicId=general', { token: alice })).value.messages;
+  assert.equal(listed.at(-1).replyTo.text, 'Dinner at eight?');
+  assert.equal(listed[0].replyToId, null);
+  assert.equal((await f.request('/v1/messages/' + reply.value.id, { token: alice })).value.replyTo.id, original.id);
+  const resent = await f.request('/v1/messages', { method: 'POST', token: bob,
+    body: { text: 'Perfect', clientId: 'reply-answer-1', pairId, replyToId: original.id } });
+  assert.equal(resent.status, 200);
+  assert.equal(resent.value.replyTo.id, original.id);
+
+  // A photo can be quoted, and a photo can be the reply.
+  const toPhoto = await f.request('/v1/messages', { method: 'POST', token: bob,
+    body: { text: 'Love this', clientId: 'reply-photo-1', pairId, replyToId: photo.id } });
+  assert.deepEqual(toPhoto.value.replyTo, { id: photo.id, senderId: photo.senderId, kind: 'image', text: null });
+  const photoReply = await f.request('/v1/media', { method: 'POST', token: bob, body: new Uint8Array([4, 5]),
+    headers: { 'content-type': 'image/png', 'x-pair-id': pairId, 'x-reply-to-id': String(original.id) } });
+  assert.equal(photoReply.status, 201);
+  assert.equal(photoReply.value.replyTo.id, original.id);
+
+  // Long quotes are trimmed for the bubble; the original is unchanged.
+  const long = (await f.request('/v1/messages', { method: 'POST', token: alice,
+    body: { text: 'x'.repeat(1000), clientId: 'reply-long-1', pairId } })).value;
+  const quoted = await f.request('/v1/messages', { method: 'POST', token: bob,
+    body: { text: 'ok', clientId: 'reply-long-2', pairId, replyToId: long.id } });
+  assert.equal(quoted.value.replyTo.text.length, 280);
+
+  // Cannot quote across topics, connections, or nonexistent messages.
+  for (const replyToId of [999999, 'abc', -1, 1.5]) {
+    assert.equal((await f.request('/v1/messages', { method: 'POST', token: bob,
+      body: { text: 'nope', clientId: `reply-bad-${String(replyToId).replace(/\W/g, '')}`, pairId, replyToId } })).status, 400);
+  }
+  assert.equal((await f.request('/v1/messages', { method: 'POST', token: bob,
+    body: { text: 'wrong topic', clientId: 'reply-cross-1', pairId, topicId: topic.id, replyToId: original.id } })).status, 400);
+  assert.equal((await f.request('/v1/media', { method: 'POST', token: bob, body: new Uint8Array([6]),
+    headers: { 'content-type': 'image/png', 'x-pair-id': pairId, 'x-topic-id': topic.id,
+      'x-reply-to-id': String(original.id) } })).status, 400);
+
+  await f.request('/v1/pair', { method: 'DELETE', token: alice });
+  const eve = await f.login('reply-e@example.com');
+  const next = (await f.request('/v1/invites', { method: 'POST', token: alice })).value;
+  const newPair = (await f.request('/v1/invites/accept', { method: 'POST', token: eve,
+    body: { code: next.code } })).value.pair.id;
+  assert.equal((await f.request('/v1/messages', { method: 'POST', token: eve,
+    body: { text: 'old quote', clientId: 'reply-old-pair', pairId: newPair, replyToId: original.id } })).status, 400);
+});

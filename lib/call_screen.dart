@@ -291,7 +291,7 @@ class _CallScreenState extends State<CallScreen> {
         if (!didPop) _hangUp();
       },
       child: Scaffold(
-        backgroundColor: const Color(0xFF142D27),
+        backgroundColor: night,
         body: SafeArea(
           child: Column(
             children: [
@@ -302,13 +302,13 @@ class _CallScreenState extends State<CallScreen> {
                 ),
                 child: Row(
                   children: [
-                    const Icon(Icons.link_rounded, color: gold, size: 22),
+                    const Icon(Icons.link_rounded, color: apricot, size: 22),
                     const SizedBox(width: 10),
                     const Text(
                       'aida',
                       style: TextStyle(
-                        fontFamily: 'serif',
-                        color: cream,
+                        fontFamily: serif,
+                        color: nightText,
                         fontSize: 25,
                       ),
                     ),
@@ -342,10 +342,7 @@ class _CallScreenState extends State<CallScreen> {
                                     gradient: LinearGradient(
                                       begin: Alignment.topLeft,
                                       end: Alignment.bottomRight,
-                                      colors: [
-                                        Color(0xFF244C40),
-                                        Color(0xFF142D27),
-                                      ],
+                                      colors: [nightRaised, night],
                                     ),
                                   ),
                                   child: Column(
@@ -360,8 +357,8 @@ class _CallScreenState extends State<CallScreen> {
                                       Text(
                                         widget.partnerName,
                                         style: const TextStyle(
-                                          fontFamily: 'serif',
-                                          color: cream,
+                                          fontFamily: serif,
+                                          color: nightText,
                                           fontSize: 34,
                                         ),
                                       ),
@@ -391,7 +388,7 @@ class _CallScreenState extends State<CallScreen> {
                             child: Container(
                               clipBehavior: Clip.antiAlias,
                               decoration: BoxDecoration(
-                                color: const Color(0xFF355C51),
+                                color: nightControl,
                                 borderRadius: BorderRadius.circular(20),
                                 border: Border.all(
                                   color: Colors.white30,
@@ -443,14 +440,14 @@ class _CallScreenState extends State<CallScreen> {
                       Text(
                         _error!,
                         textAlign: TextAlign.center,
-                        style: const TextStyle(color: gold, fontSize: 12),
+                        style: const TextStyle(color: apricot, fontSize: 12),
                       ),
                       if (!_joined && _state == 'active')
                         TextButton(
                           onPressed: _joining ? null : _join,
                           child: const Text(
                             'Retry',
-                            style: TextStyle(color: cream),
+                            style: TextStyle(color: nightText),
                           ),
                         ),
                     ],
@@ -471,7 +468,7 @@ class _CallScreenState extends State<CallScreen> {
                         Icons.call,
                         'Answer',
                         _answer,
-                        color: const Color(0xFF589476),
+                        color: answerGreen,
                       )
                     else ...[
                       _control(
@@ -531,7 +528,7 @@ class _CallScreenState extends State<CallScreen> {
                       Icons.call_end,
                       _incoming && _state == 'ringing' ? 'Decline' : 'End',
                       _hangUp,
-                      color: const Color(0xFFCA6356),
+                      color: endRed,
                     ),
                   ],
                 ),
@@ -547,7 +544,7 @@ class _CallScreenState extends State<CallScreen> {
     IconData icon,
     String label,
     VoidCallback action, {
-    Color color = const Color(0xFF35564A),
+    Color color = nightControl,
   }) => Column(
     mainAxisSize: MainAxisSize.min,
     children: [

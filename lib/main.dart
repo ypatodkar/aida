@@ -17,7 +17,9 @@ import 'api.dart';
 import 'call_screen.dart';
 import 'media_view.dart';
 import 'design.dart';
+import 'moments_screen.dart';
 import 'notifications.dart';
+import 'us_screen.dart';
 
 void main() => runApp(const AidaApp());
 
@@ -37,6 +39,9 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
   static const _googleWebClientId = String.fromEnvironment(
     'GOOGLE_WEB_CLIENT_ID',
   );
+  static const _preview =
+      kDebugMode && bool.fromEnvironment('AIDA_DESIGN_PREVIEW');
+  static const _version = 'Aida 2.1.0';
 
   final _nameController = TextEditingController();
   final _inviteController = TextEditingController();
@@ -82,6 +87,18 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
   List<Map<String, dynamic>> _messages = [];
   String? _loadedPairId;
   double? _uploadProgress;
+  ThemeMode _themeMode = ThemeMode.system;
+  AidaAccent _accent = AidaAccent.lavender;
+
+  /// Messages that arrived while the conversation was open; only these get
+  /// an entrance animation, never history loaded on open or topic switch.
+  final Set<int> _freshIds = {};
+
+  /// The message being replied to, shown above the composer until sent.
+  Map<String, dynamic>? _replyTo;
+  int? _highlightId;
+  Timer? _highlightTimer;
+  final Map<int, GlobalKey> _messageKeys = {};
 
   @override
   void initState() {
@@ -102,6 +119,7 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
     _presenceTimer?.cancel();
     _typingIdleTimer?.cancel();
     _partnerTypingTimer?.cancel();
+    _highlightTimer?.cancel();
     _socketSubscription?.cancel();
     _socket?.sink.close();
     _api?.close();
@@ -114,18 +132,21 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
   }
 
   Future<void> _boot() async {
-    if (kDebugMode && const bool.fromEnvironment('AIDA_DESIGN_PREVIEW')) {
+    if (_preview) {
       _api = AidaApi('https://preview.invalid', token: 'preview-only');
       _state = {
         'user': {'id': 'me', 'name': 'Yash'},
         'pair': {
           'id': 'preview',
           'partner': {'id': 'them', 'name': 'Sofia', 'online': true},
+          'createdAt': DateTime.now()
+              .subtract(const Duration(days: 141))
+              .millisecondsSinceEpoch,
         },
       };
       _liveReady = true;
       _partnerRead = 3;
-      _partnerDelivered = 3;
+      _partnerDelivered = 5;
       _topics = [
         {'id': 'general', 'name': 'Everyday'},
         {'id': 'trip', 'name': 'Summer in Italy'},
@@ -150,14 +171,28 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
           'id': 3,
           'senderId': 'me',
           'kind': 'text',
-          'text': 'Already my favorite place. Just because you’re there.',
+          'text': 'Already my favorite place.',
+          'createdAt': DateTime.now().millisecondsSinceEpoch - 70000,
+        },
+        {
+          'id': 5,
+          'senderId': 'me',
+          'kind': 'text',
+          'text': 'Just because you’re there.',
           'createdAt': DateTime.now().millisecondsSinceEpoch - 60000,
         },
         {
-          'id': 4,
+          'id': 6,
           'senderId': 'them',
           'kind': 'text',
           'text': 'Let’s put it in our Italy plans ✨',
+          'replyToId': 3,
+          'replyTo': {
+            'id': 3,
+            'senderId': 'me',
+            'kind': 'text',
+            'text': 'Already my favorite place.',
+          },
           'createdAt': DateTime.now().millisecondsSinceEpoch,
         },
       ];
@@ -166,6 +201,10 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
     }
     await _notifications.initialize();
     _notifications.onTap = _handleNotice;
+    _notifications.showInForeground = (data) => foregroundPushShouldNotify(
+      liveConnected: _liveReady,
+      conversationVisible: _viewing(data),
+    );
     await _restore();
     if (_api?.token != null) {
       unawaited(_registerNotifications());
@@ -243,8 +282,17 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
     if (read > _partnerRead) _partnerRead = read;
   }
 
+  /// Whether this exact conversation is on screen right now, so a new
+  /// message in it needs no system notification.
+  bool _viewing(Map<String, dynamic> event) =>
+      _foreground &&
+      !_callScreenOpen &&
+      _navigatorKey.currentState?.canPop() == false &&
+      event['pairId'] == _loadedPairId &&
+      (event['topicId'] ?? 'general') == _topicId;
+
   void _ackVisibleMessages() {
-    if (kDebugMode && const bool.fromEnvironment('AIDA_DESIGN_PREVIEW')) return;
+    if (_preview) return;
     unawaited(_ackMessages());
   }
 
@@ -254,9 +302,9 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
     final topicId = _topicId;
     if (api?.token == null || pairId == null || _messages.isEmpty) return;
     final last = _messages.last['id'] as int;
+    // The list is reversed: offset 0 is the newest message.
     final atBottom =
-        _scrollController.hasClients &&
-        _scrollController.position.extentAfter < 40;
+        _scrollController.hasClients && _scrollController.position.pixels < 40;
     final read =
         allowRead &&
             _foreground &&
@@ -273,7 +321,11 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
     final oldDelivered = _deliveredAcks[key] ?? 0;
     final oldRead = _readAcks[key] ?? 0;
     _deliveredAcks[key] = last;
-    if (read > oldRead) _readAcks[key] = read;
+    if (read > oldRead) {
+      _readAcks[key] = read;
+      // Read in the app, so its notification no longer needs attention.
+      unawaited(_notifications.cancelTopic(pairId, topicId));
+    }
     try {
       await api!.acknowledgeMessages(
         pairId: pairId,
@@ -342,6 +394,9 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
     setState(() {
       _topicId = id;
       _messages = [];
+      _freshIds.clear();
+      _messageKeys.clear();
+      _replyTo = null;
     });
     if (_loadedPairId != null) {
       await _storage.write(key: 'topic_$_loadedPairId', value: id);
@@ -388,6 +443,12 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
   }
 
   Future<void> _restore() async {
+    final mode = await _storage.read(key: 'theme_mode');
+    _themeMode = ThemeMode.values.firstWhere(
+      (value) => value.name == mode,
+      orElse: () => ThemeMode.system,
+    );
+    _accent = AidaAccent.named(await _storage.read(key: 'accent'));
     final url = await _storage.read(key: 'api_url') ?? _defaultUrl;
     final token = await _storage.read(key: 'session_token');
     _api = AidaApi(url, token: token);
@@ -401,6 +462,26 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
     });
     if (mounted) setState(() => _loading = false);
   }
+
+  Future<void> _setThemeMode(ThemeMode mode) async {
+    setState(() => _themeMode = mode);
+    try {
+      await _storage.write(key: 'theme_mode', value: mode.name);
+    } catch (_) {
+      // Appearance is a convenience; the choice still applies this session.
+    }
+  }
+
+  Future<void> _setAccent(AidaAccent accent) async {
+    setState(() => _accent = accent);
+    try {
+      await _storage.write(key: 'accent', value: accent.name);
+    } catch (_) {}
+  }
+
+  /// Leaves Us/Moments once the account or connection they describe is gone.
+  void _returnHome() =>
+      _navigatorKey.currentState?.popUntil((route) => route.isFirst);
 
   void _showError(Object error) {
     if (!mounted) return;
@@ -438,6 +519,9 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
         _readAcks.clear();
         _messageGeneration++;
         _messages = [];
+        _freshIds.clear();
+        _messageKeys.clear();
+        _replyTo = null;
         _call = null;
         _loadedPairId = pairId;
         _topicId = pairId == null
@@ -507,7 +591,7 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
     final followLatest =
         _messages.isEmpty ||
         !_scrollController.hasClients ||
-        _scrollController.position.extentAfter < 80;
+        _scrollController.position.pixels < 80;
     var cursor = _messages.isEmpty ? 0 : _messages.last['id'] as int;
     while (true) {
       final page = await api.messages(after: cursor, topicId: topicId);
@@ -521,20 +605,22 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
       if (receipt != null) setState(() => _applyReceipt(receipt));
       if (items.isNotEmpty && mounted) {
         final latest = _messages.isEmpty ? 0 : _messages.last['id'] as int;
-        setState(
-          () => _messages.addAll(
-            items.where((item) => (item['id'] as int) > latest),
-          ),
-        );
+        final fresh = items
+            .where((item) => (item['id'] as int) > latest)
+            .toList();
+        setState(() {
+          if (_messages.isNotEmpty) {
+            _freshIds.addAll(fresh.map((item) => item['id'] as int));
+          }
+          _messages.addAll(fresh);
+        });
         cursor = items.last['id'] as int;
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (mounted &&
               generation == _messageGeneration &&
               followLatest &&
               _scrollController.hasClients) {
-            _scrollController.jumpTo(
-              _scrollController.position.maxScrollExtent,
-            );
+            _scrollController.jumpTo(0);
           }
         });
       }
@@ -596,7 +682,12 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
           }
           unawaited(_refresh());
           if (event['type'] == 'messages_changed' &&
-              event['messageId'] != null) {
+              event['messageId'] != null &&
+              socketShouldNotify(
+                foreground: _foreground,
+                conversationVisible: _viewing(event),
+                pushActive: _notifications.pushActive,
+              )) {
             unawaited(showRemoteEvent({...event, 'type': 'message'}));
           }
         },
@@ -683,6 +774,7 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
       _loadedPairId = null;
       _problem = null;
     });
+    _returnHome();
   }
 
   Future<void> _googleSignIn() => _run(() async {
@@ -729,6 +821,7 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
       _messages = [];
       _call = null;
     });
+    _returnHome();
   });
 
   Future<void> _createInvite() => _run(() async {
@@ -824,24 +917,29 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
       PaintingBinding.instance.imageCache.clear();
       PaintingBinding.instance.imageCache.clearLiveImages();
       await _refresh();
+      _returnHome();
     });
   }
 
   Future<void> _sendText() => _run(() async {
     final text = _messageController.text.trim();
     if (text.isEmpty) return;
+    final reply = _replyTo;
     _stopTyping();
     _messageController.clear();
+    setState(() => _replyTo = null);
     try {
       await _api!.sendMessage(
         text,
         _uuid.v4(),
         topicId: _topicId,
         pairId: _loadedPairId,
+        replyToId: reply?['id'] as int?,
       );
       await _loadMessages();
     } catch (_) {
       _messageController.text = text;
+      if (mounted && _replyTo == null) setState(() => _replyTo = reply);
       rethrow;
     }
   });
@@ -849,6 +947,7 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
   Future<void> _pickAndUpload(bool video) => _run(() async {
     final uploadPair = _loadedPairId;
     final uploadTopic = _topicId;
+    final reply = _replyTo;
     final picked = video
         ? await _picker.pickVideo(source: ImageSource.gallery)
         : await _picker.pickImage(source: ImageSource.gallery);
@@ -880,10 +979,14 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
         mime,
         topicId: uploadTopic,
         pairId: uploadPair,
+        replyToId: reply?['id'] as int?,
         onProgress: (fraction) {
           if (mounted) setState(() => _uploadProgress = fraction);
         },
       );
+      if (mounted && identical(_replyTo, reply)) {
+        setState(() => _replyTo = null);
+      }
       await _loadMessages();
     } finally {
       if (mounted) setState(() => _uploadProgress = null);
@@ -931,6 +1034,74 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _enableNotifications() => _run(() async {
+    await _registerNotifications();
+    _messengerKey.currentState?.showSnackBar(
+      SnackBar(
+        content: Text(
+          !_notifications.permissionGranted
+              ? 'Allow Aida notifications in Android settings to receive alerts.'
+              : _notifications.firebaseReady && _notifications.serverReady
+              ? 'Message and call notifications are enabled.'
+              : 'Notifications are not available yet. Please try again later.',
+        ),
+      ),
+    );
+  });
+
+  void _openMoments() {
+    final pair = _state?['pair'] as Map<String, dynamic>?;
+    if (pair == null) return;
+    _stopTyping();
+    _navigatorKey.currentState!
+        .push(
+          MaterialPageRoute(
+            builder: (_) => MomentsScreen(
+              api: _api!,
+              since: pair['createdAt'] as int?,
+              myName: (_state!['user'] as Map)['name']?.toString() ?? '',
+              partnerName: (pair['partner'] as Map)['name']?.toString() ?? '',
+              preview: _preview ? _previewMedia : null,
+            ),
+          ),
+        )
+        .then((_) => _ackVisibleMessages());
+  }
+
+  void _openUs() {
+    _stopTyping();
+    _navigatorKey.currentState!
+        .push(
+          MaterialPageRoute(
+            builder: (_) => UsScreen(
+              state: () => _state,
+              presence: _presenceLabel,
+              themeMode: () => _themeMode,
+              accent: () => _accent,
+              onThemeMode: _setThemeMode,
+              onAccent: _setAccent,
+              onChangeName: _changeName,
+              onNotifications: _enableNotifications,
+              onServer: _serverSettings,
+              onSignOut: _signOut,
+              onDisconnect: _disconnect,
+              version: _version,
+            ),
+          ),
+        )
+        .then((_) => _ackVisibleMessages());
+  }
+
+  static final _previewMedia = [
+    for (var i = 0; i < 7; i++)
+      {
+        'id': 100 + i,
+        'kind': i == 2 ? 'video' : 'image',
+        'mediaId': 'preview-$i',
+        'createdAt': DateTime.now().millisecondsSinceEpoch,
+      },
+  ];
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -938,14 +1109,16 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
       navigatorKey: _navigatorKey,
       scaffoldMessengerKey: _messengerKey,
       debugShowCheckedModeBanner: false,
-      theme: aidaTheme(),
+      theme: aidaTheme(Brightness.light, _accent),
+      darkTheme: aidaTheme(Brightness.dark, _accent),
+      themeMode: _themeMode,
       home: Builder(
         builder: (context) => _loading
-            ? const Scaffold(body: Center(child: AidaMark()))
+            ? const Scaffold(body: Center(child: AidaMark(breathing: true)))
             : _api?.token == null
             ? _authScreen(context)
             : _state == null
-            ? _connectionScreen()
+            ? _connectionScreen(context)
             : _state?['pair'] == null
             ? _unpairedScreen(context)
             : _chatScreen(context),
@@ -953,112 +1126,122 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
     );
   }
 
-  Widget _authScreen(BuildContext context) => Scaffold(
-    body: SafeArea(
-      child: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 480),
-          child: ListView(
-            padding: const EdgeInsets.fromLTRB(28, 24, 28, 32),
-            children: [
-              Row(
-                children: [
-                  const Text(
-                    'aida',
-                    style: TextStyle(
-                      fontFamily: 'serif',
-                      fontSize: 32,
-                      color: ink,
+  Widget _authScreen(BuildContext context) {
+    final c = context.aida;
+    return Scaffold(
+      body: SafeArea(
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 480),
+            child: ListView(
+              padding: const EdgeInsets.fromLTRB(28, 16, 28, 32),
+              children: [
+                Row(
+                  children: [
+                    Text(
+                      'aida',
+                      style: TextStyle(
+                        fontFamily: serif,
+                        fontSize: 34,
+                        color: c.ink,
+                      ),
+                    ),
+                    const Spacer(),
+                    IconButton(
+                      tooltip: 'Server settings',
+                      onPressed: _serverSettings,
+                      icon: Icon(Icons.tune_rounded, size: 21, color: c.muted),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 36),
+                Container(
+                  height: 236,
+                  decoration: BoxDecoration(
+                    gradient: RadialGradient(
+                      colors: [c.accentSoft, c.background],
+                      radius: .85,
+                    ),
+                    borderRadius: BorderRadius.circular(120),
+                  ),
+                  child: const Center(
+                    child: AidaMark(size: 132, breathing: true),
+                  ),
+                ),
+                const SizedBox(height: 40),
+                const Eyebrow('A little closer'),
+                const SizedBox(height: 14),
+                Text(
+                  'Your person.\nYour little world.',
+                  style: Theme.of(context).textTheme.headlineLarge,
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  'The everyday stories, the big plans, and the calls that make the distance feel smaller.',
+                  style: TextStyle(color: c.muted, fontSize: 16, height: 1.6),
+                ),
+                const SizedBox(height: 32),
+                FilledButton.icon(
+                  onPressed: _busy ? null : _googleSignIn,
+                  icon: const Icon(Icons.account_circle_outlined),
+                  label: Text(_busy ? 'Signing in…' : 'Continue with Google'),
+                ),
+                const SizedBox(height: 18),
+                Text(
+                  'One connection. A space just for you two.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: c.muted, fontSize: 12),
+                ),
+                if (_problem != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 18),
+                    child: Text(
+                      _problem!,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: c.danger),
                     ),
                   ),
-                  const Spacer(),
-                  IconButton(
-                    tooltip: 'Server settings',
-                    onPressed: _serverSettings,
-                    icon: const Icon(Icons.tune_rounded, size: 21),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 54),
-              Container(
-                height: 230,
-                decoration: BoxDecoration(
-                  color: sage,
-                  borderRadius: BorderRadius.circular(100),
-                ),
-                child: const Center(child: AidaMark(size: 140)),
-              ),
-              const SizedBox(height: 40),
-              const Text(
-                'A LITTLE CLOSER',
-                style: TextStyle(
-                  letterSpacing: 3,
-                  fontSize: 10,
-                  color: muted,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-              const SizedBox(height: 12),
-              Text(
-                'Your person.\nYour little world.',
-                style: Theme.of(context).textTheme.headlineLarge,
-              ),
-              const SizedBox(height: 18),
-              const Text(
-                'The everyday stories, the big plans, and the calls that make the distance feel smaller.',
-                style: TextStyle(color: muted, fontSize: 16, height: 1.6),
-              ),
-              const SizedBox(height: 32),
-              FilledButton.icon(
-                onPressed: _busy ? null : _googleSignIn,
-                icon: const Icon(Icons.account_circle_outlined),
-                label: Text(_busy ? 'Signing in…' : 'Continue with Google'),
-              ),
-              const SizedBox(height: 18),
-              const Text(
-                'One connection. A space just for you two.',
-                textAlign: TextAlign.center,
-                style: TextStyle(color: muted, fontSize: 12),
-              ),
-              if (_problem != null)
-                Padding(
-                  padding: const EdgeInsets.only(top: 18),
-                  child: Text(
-                    _problem!,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(color: Color(0xFFAD5144)),
-                  ),
-                ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
-    ),
-  );
+    );
+  }
 
-  Widget _connectionScreen() {
+  Widget _connectionScreen(BuildContext context) {
+    final c = context.aida;
     return Scaffold(
-      appBar: AppBar(title: const Text('Aida')),
-      body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.cloud_off_outlined, size: 56),
-              const SizedBox(height: 16),
-              Text(
-                _problem ?? 'Connecting to your server…',
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 16),
-              FilledButton(onPressed: _refresh, child: const Text('Retry')),
-              TextButton(
-                onPressed: _serverSettings,
-                child: const Text('Change server address'),
-              ),
-              TextButton(onPressed: _signOut, child: const Text('Sign out')),
-            ],
+      body: SafeArea(
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(32),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const AidaMark(size: 64, breathing: true),
+                const SizedBox(height: 24),
+                Text(
+                  _problem == null ? 'Finding your space…' : 'Can’t connect',
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.headlineSmall,
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  _problem ?? 'Connecting to your server.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: c.muted),
+                ),
+                const SizedBox(height: 24),
+                FilledButton(onPressed: _refresh, child: const Text('Retry')),
+                const SizedBox(height: 4),
+                TextButton(
+                  onPressed: _serverSettings,
+                  child: const Text('Change server address'),
+                ),
+                TextButton(onPressed: _signOut, child: const Text('Sign out')),
+              ],
+            ),
           ),
         ),
       ),
@@ -1066,15 +1249,22 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
   }
 
   Widget _unpairedScreen(BuildContext context) {
+    final c = context.aida;
     final user = (_state?['user'] as Map<String, dynamic>?) ?? {};
     final code = (_state?['invite'] as Map?)?['code']?.toString();
+    final soft = c.onHero.withValues(alpha: .64);
     return Scaffold(
       appBar: AppBar(
-        title: const Text(
+        title: Text(
           'aida',
-          style: TextStyle(fontFamily: 'serif', fontSize: 30),
+          style: TextStyle(
+            fontFamily: serif,
+            fontSize: 32,
+            fontWeight: FontWeight.w400,
+            color: c.ink,
+          ),
         ),
-        actions: [_accountMenu()],
+        actions: [_accountMenu(), const SizedBox(width: 6)],
       ),
       body: Center(
         child: ConstrainedBox(
@@ -1082,7 +1272,7 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
           child: ListView(
             padding: const EdgeInsets.all(24),
             children: [
-              const SizedBox(height: 24),
+              const SizedBox(height: 16),
               Align(
                 alignment: Alignment.centerLeft,
                 child: PersonAvatar(user['name']?.toString() ?? 'A', size: 64),
@@ -1093,140 +1283,153 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
                 style: Theme.of(context).textTheme.headlineMedium,
               ),
               const SizedBox(height: 14),
-              const Text(
+              Text(
                 'Invite your person into a shared space for conversations, plans, and being together.',
-                style: TextStyle(color: muted, height: 1.6),
+                style: TextStyle(color: c.muted, height: 1.6),
               ),
               const SizedBox(height: 30),
-              Container(
-                padding: const EdgeInsets.all(24),
-                decoration: BoxDecoration(
-                  color: ink,
-                  borderRadius: BorderRadius.circular(28),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    const Icon(Icons.link_rounded, color: gold, size: 32),
-                    const SizedBox(height: 18),
-                    Text(
-                      code == null
-                          ? 'It starts with an invitation.'
-                          : 'Your invitation is ready.',
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(
-                        fontFamily: 'serif',
-                        color: cream,
-                        fontSize: 25,
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    if (code == null) ...[
-                      const Text(
-                        'Only the person who accepts your code can join you.',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(color: Colors.white70),
-                      ),
-                      const SizedBox(height: 22),
-                      FilledButton(
-                        onPressed: _busy ? null : _createInvite,
-                        style: FilledButton.styleFrom(
-                          backgroundColor: gold,
-                          foregroundColor: ink,
-                        ),
-                        child: const Text('Create invite'),
-                      ),
-                    ] else ...[
-                      SelectableText(
-                        code,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                          letterSpacing: 3,
-                          fontSize: 25,
-                          color: gold,
+              AnimatedSize(
+                duration: const Duration(milliseconds: 260),
+                curve: Curves.easeOutCubic,
+                child: Container(
+                  padding: const EdgeInsets.all(24),
+                  decoration: BoxDecoration(
+                    color: c.hero,
+                    borderRadius: BorderRadius.circular(28),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Center(
+                        child: AidaMark(
+                          size: 44,
+                          breathing: code != null,
+                          first: c.onHero,
+                          second: c.warm,
                         ),
                       ),
-                      const SizedBox(height: 12),
-                      const Text(
-                        'One use · Expires in 24 hours',
+                      const SizedBox(height: 16),
+                      Text(
+                        code == null
+                            ? 'It starts with an invitation.'
+                            : 'Your invitation is ready.',
                         textAlign: TextAlign.center,
-                        style: TextStyle(color: Colors.white60, fontSize: 12),
+                        style: TextStyle(
+                          fontFamily: serif,
+                          color: c.onHero,
+                          fontSize: 28,
+                        ),
                       ),
-                      const SizedBox(height: 20),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          IconButton(
-                            tooltip: 'Copy code',
-                            onPressed: () {
-                              Clipboard.setData(ClipboardData(text: code));
-                              _messengerKey.currentState?.showSnackBar(
-                                const SnackBar(
-                                  content: Text('Invite code copied'),
-                                ),
-                              );
-                            },
-                            icon: const Icon(Icons.copy_rounded, color: cream),
+                      const SizedBox(height: 10),
+                      if (code == null) ...[
+                        Text(
+                          'Only the person who accepts your code can join you.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(color: soft),
+                        ),
+                        const SizedBox(height: 22),
+                        FilledButton(
+                          onPressed: _busy ? null : _createInvite,
+                          style: FilledButton.styleFrom(
+                            backgroundColor: c.warm,
+                            foregroundColor: night,
                           ),
-                          const SizedBox(width: 8),
-                          FilledButton.icon(
-                            style: FilledButton.styleFrom(
-                              backgroundColor: gold,
-                              foregroundColor: ink,
+                          child: const Text('Create invite'),
+                        ),
+                      ] else ...[
+                        SelectableText(
+                          code,
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            letterSpacing: 4,
+                            fontSize: 26,
+                            fontWeight: FontWeight.w500,
+                            color: c.warm,
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        Text(
+                          'One use · Expires in 24 hours',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(color: soft, fontSize: 12),
+                        ),
+                        const SizedBox(height: 20),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            IconButton(
+                              tooltip: 'Copy code',
+                              onPressed: () {
+                                Clipboard.setData(ClipboardData(text: code));
+                                _messengerKey.currentState?.showSnackBar(
+                                  const SnackBar(
+                                    content: Text('Invite code copied'),
+                                  ),
+                                );
+                              },
+                              icon: Icon(Icons.copy_rounded, color: c.onHero),
                             ),
-                            onPressed: () => SharePlus.instance.share(
-                              ShareParams(
-                                text:
-                                    'Join me on Aida. My invite code is $code',
+                            const SizedBox(width: 8),
+                            FilledButton.icon(
+                              style: FilledButton.styleFrom(
+                                backgroundColor: c.warm,
+                                foregroundColor: night,
                               ),
+                              onPressed: () => SharePlus.instance.share(
+                                ShareParams(
+                                  text:
+                                      'Join me on Aida. My invite code is $code',
+                                ),
+                              ),
+                              icon: const Icon(Icons.ios_share_rounded),
+                              label: const Text('Share invite'),
                             ),
-                            icon: const Icon(Icons.ios_share_rounded),
-                            label: const Text('Share invite'),
-                          ),
-                        ],
-                      ),
-                      TextButton(
-                        onPressed: _busy
-                            ? null
-                            : () => _run(() async {
-                                await _api!.revokeInvite();
-                                await _refresh();
-                              }),
-                        child: const Text(
-                          'Revoke invite',
-                          style: TextStyle(color: Colors.white60),
+                          ],
                         ),
-                      ),
+                        TextButton(
+                          onPressed: _busy
+                              ? null
+                              : () => _run(() async {
+                                  await _api!.revokeInvite();
+                                  await _refresh();
+                                }),
+                          child: Text(
+                            'Revoke invite',
+                            style: TextStyle(color: soft),
+                          ),
+                        ),
+                      ],
                     ],
-                  ],
+                  ),
                 ),
               ),
               const SizedBox(height: 32),
-              const Text(
+              Text(
                 'Already have an invite?',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+                style: Theme.of(context).textTheme.titleLarge,
               ),
               const SizedBox(height: 12),
               TextField(
                 controller: _inviteController,
                 textCapitalization: TextCapitalization.characters,
                 maxLength: 10,
-                decoration: const InputDecoration(
+                decoration: InputDecoration(
                   hintText: 'Enter their code',
-                  prefixIcon: Icon(Icons.key_outlined),
+                  prefixIcon: Icon(Icons.key_outlined, color: c.muted),
                 ),
               ),
               FilledButton.tonal(
                 onPressed: _busy ? null : _acceptInvite,
+                style: FilledButton.styleFrom(
+                  backgroundColor: c.accentSoft,
+                  foregroundColor: c.accent,
+                ),
                 child: const Text('Review invitation'),
               ),
               if (_problem != null)
                 Padding(
                   padding: const EdgeInsets.only(top: 18),
-                  child: Text(
-                    _problem!,
-                    style: const TextStyle(color: Colors.redAccent),
-                  ),
+                  child: Text(_problem!, style: TextStyle(color: c.danger)),
                 ),
             ],
           ),
@@ -1235,52 +1438,58 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
     );
   }
 
-  Widget _accountMenu({bool paired = false}) => PopupMenuButton<String>(
+  Widget _accountMenu() => PopupMenuButton<String>(
     tooltip: 'Your account',
     icon: const Icon(Icons.more_horiz_rounded),
+    position: PopupMenuPosition.under,
     onSelected: (value) {
       if (value == 'name') _changeName();
       if (value == 'signout') _signOut();
-      if (value == 'disconnect') _disconnect();
       if (value == 'server') _serverSettings();
-      if (value == 'notifications') {
-        _run(() async {
-          await _registerNotifications();
-          _messengerKey.currentState?.showSnackBar(
-            SnackBar(
-              content: Text(
-                !_notifications.permissionGranted
-                    ? 'Allow Aida notifications in Android settings to receive alerts.'
-                    : _notifications.firebaseReady && _notifications.serverReady
-                    ? 'Message and call notifications are enabled.'
-                    : 'Notifications are not available yet. Please try again later.',
-              ),
-            ),
-          );
-        });
-      }
+      if (value == 'notifications') _enableNotifications();
     },
-    itemBuilder: (_) => [
-      const PopupMenuItem(value: 'name', child: Text('Your name')),
-      const PopupMenuItem(
+    itemBuilder: (_) => const [
+      PopupMenuItem(value: 'name', child: Text('Your name')),
+      PopupMenuItem(
         value: 'notifications',
         child: Text('Enable notifications'),
       ),
-      if (paired)
-        const PopupMenuItem(
-          value: 'disconnect',
-          child: Text('Disconnect and delete'),
-        ),
-      const PopupMenuItem(value: 'server', child: Text('Server settings')),
-      const PopupMenuItem(value: 'signout', child: Text('Sign out')),
-      const PopupMenuItem(enabled: false, child: Text('Aida 2.0.1')),
+      PopupMenuItem(value: 'server', child: Text('Server settings')),
+      PopupMenuItem(value: 'signout', child: Text('Sign out')),
+      PopupMenuItem(enabled: false, child: Text(_version)),
     ],
   );
 
+  Widget _menuRow(AidaColors c, IconData icon, String title, [String? hint]) =>
+      Row(
+        children: [
+          Icon(icon, size: 21, color: c.accent),
+          const SizedBox(width: 14),
+          Flexible(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(title, style: TextStyle(color: c.ink, fontSize: 15)),
+                if (hint != null)
+                  Text(
+                    hint,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(color: c.muted, fontSize: 12),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      );
+
   Widget _chatScreen(BuildContext context) {
+    final c = context.aida;
     final pair = _state!['pair'] as Map<String, dynamic>;
     final partner = pair['partner'] as Map<String, dynamic>;
     final user = _state!['user'] as Map<String, dynamic>;
+    final online = _liveReady && partner['online'] == true;
     final topicName =
         _topics.firstWhere(
               (t) => t['id'] == _topicId,
@@ -1289,50 +1498,85 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
             as String;
     return Scaffold(
       appBar: AppBar(
-        toolbarHeight: 86,
-        titleSpacing: 20,
-        title: Row(
-          children: [
-            PersonAvatar(partner['name'] as String),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+        toolbarHeight: 72,
+        titleSpacing: 8,
+        title: Material(
+          type: MaterialType.transparency,
+          child: InkWell(
+            onTap: _openUs,
+            borderRadius: BorderRadius.circular(20),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(8, 6, 8, 6),
+              child: Row(
                 children: [
-                  Text(
-                    partner['name'] as String,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  const SizedBox(height: 3),
-                  Row(
+                  Stack(
+                    clipBehavior: Clip.none,
                     children: [
-                      Icon(
-                        Icons.circle,
-                        size: 6,
-                        color: _liveReady && partner['online'] == true
-                            ? const Color(0xFF46956A)
-                            : muted,
-                      ),
-                      const SizedBox(width: 5),
-                      Flexible(
-                        child: Text(
-                          _presenceLabel(partner),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontSize: 11, color: muted),
+                      PersonAvatar(partner['name'] as String, size: 42),
+                      Positioned(
+                        right: -1,
+                        bottom: -1,
+                        child: AnimatedScale(
+                          scale: online ? 1 : 0,
+                          duration: const Duration(milliseconds: 240),
+                          curve: Curves.easeOutBack,
+                          child: Container(
+                            width: 12,
+                            height: 12,
+                            decoration: BoxDecoration(
+                              color: c.online,
+                              shape: BoxShape.circle,
+                              border: Border.all(color: c.background, width: 2),
+                            ),
+                          ),
                         ),
                       ),
                     ],
                   ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          partner['name'] as String,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontFamily: serif,
+                            fontSize: 26,
+                            fontWeight: FontWeight.w400,
+                            height: 1.1,
+                            color: c.ink,
+                          ),
+                        ),
+                        AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 200),
+                          layoutBuilder: (current, previous) => Stack(
+                            alignment: Alignment.centerLeft,
+                            children: [...previous, ?current],
+                          ),
+                          child: Text(
+                            _partnerTyping
+                                ? 'typing…'
+                                : _presenceLabel(partner),
+                            key: ValueKey(_partnerTyping),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: _partnerTyping ? c.accent : c.muted,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
                 ],
               ),
             ),
-          ],
+          ),
         ),
         actions: [
           IconButton(
@@ -1349,309 +1593,653 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
                 : null,
             icon: const Icon(Icons.videocam_outlined, size: 25),
           ),
-          _accountMenu(paired: true),
+          PopupMenuButton<String>(
+            tooltip: 'Moments and Us',
+            icon: const Icon(Icons.more_horiz_rounded),
+            position: PopupMenuPosition.under,
+            onSelected: (value) =>
+                value == 'moments' ? _openMoments() : _openUs(),
+            itemBuilder: (_) => [
+              PopupMenuItem(
+                value: 'moments',
+                height: 60,
+                child: _menuRow(
+                  c,
+                  Icons.photo_library_outlined,
+                  'Moments',
+                  'Photos and milestones',
+                ),
+              ),
+              PopupMenuItem(
+                value: 'us',
+                height: 60,
+                child: _menuRow(
+                  c,
+                  Icons.favorite_border_rounded,
+                  'Us',
+                  'Profile, themes, privacy',
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(width: 4),
         ],
       ),
       body: Column(
         children: [
-          Container(
-            padding: const EdgeInsets.fromLTRB(16, 0, 8, 16),
-            decoration: const BoxDecoration(
-              border: Border(bottom: BorderSide(color: Color(0xFFE4E7DD))),
-            ),
-            child: Row(
-              children: [
-                Expanded(
-                  child: SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: Row(
-                      children: _topics.map((topic) {
-                        final selected = topic['id'] == _topicId;
-                        return Padding(
-                          padding: const EdgeInsets.only(right: 8),
-                          child: ChoiceChip(
-                            selected: selected,
-                            showCheckmark: false,
-                            selectedColor: ink,
-                            backgroundColor: Colors.white,
-                            side: BorderSide(
-                              color: selected ? ink : const Color(0xFFE1E5DB),
-                            ),
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 8,
-                              vertical: 8,
-                            ),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(28),
-                            ),
-                            label: Text(
-                              topic['name'] as String,
-                              style: TextStyle(
-                                color: selected ? cream : muted,
-                                fontSize: 12,
-                              ),
-                            ),
-                            onSelected: _busy
-                                ? null
-                                : (_) => _switchTopic(topic['id'] as String),
-                          ),
-                        );
-                      }).toList(),
+          _topicBar(c),
+          if (_call != null) _callBanner(c, user['id'] as String),
+          if (_problem != null)
+            Container(
+              margin: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+              padding: const EdgeInsets.fromLTRB(16, 2, 4, 2),
+              decoration: BoxDecoration(
+                color: c.surfaceMuted,
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.cloud_off_rounded, size: 18, color: c.muted),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      _problem!,
+                      style: TextStyle(color: c.muted, fontSize: 13),
                     ),
                   ),
-                ),
-                IconButton(
-                  tooltip: 'Create shared topic',
-                  onPressed: _busy ? null : _createTopic,
-                  icon: const Icon(Icons.add_rounded),
-                ),
-              ],
-            ),
-          ),
-          if (_call != null) _callBanner(user['id'] as String),
-          if (_problem != null)
-            MaterialBanner(
-              content: Text(_problem!),
-              actions: [
-                TextButton(onPressed: _refresh, child: const Text('Retry')),
-              ],
+                  TextButton(onPressed: _refresh, child: const Text('Retry')),
+                ],
+              ),
             ),
           Expanded(
             child: _messages.isEmpty
-                ? Center(
-                    child: Padding(
-                      padding: const EdgeInsets.all(36),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Container(
-                            padding: const EdgeInsets.all(24),
-                            decoration: const BoxDecoration(
-                              color: sage,
-                              shape: BoxShape.circle,
-                            ),
-                            child: Icon(
-                              _topicId == 'general'
-                                  ? Icons.chat_bubble_outline_rounded
-                                  : Icons.auto_awesome_outlined,
-                              size: 32,
-                              color: ink,
-                            ),
-                          ),
-                          const SizedBox(height: 22),
-                          Text(
-                            _topicId == 'general'
-                                ? 'The little things belong here.'
-                                : 'Let’s talk $topicName.',
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(
-                              fontFamily: 'serif',
-                              fontSize: 25,
-                              color: ink,
-                            ),
-                          ),
-                          const SizedBox(height: 12),
-                          Text(
-                            _topicId == 'general'
-                                ? 'A good morning. A passing thought.\nSomething that made you smile.'
-                                : 'A shared topic for your ideas, photos, and plans.',
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(color: muted, height: 1.7),
-                          ),
-                        ],
-                      ),
-                    ),
-                  )
-                : ListView.builder(
-                    controller: _scrollController,
-                    padding: const EdgeInsets.fromLTRB(18, 20, 18, 16),
-                    itemCount: _messages.length,
-                    itemBuilder: (context, index) {
-                      final message = _messages[index];
-                      final date = DateTime.fromMillisecondsSinceEpoch(
-                        message['createdAt'] as int,
-                      );
-                      final previous = index == 0
-                          ? null
-                          : DateTime.fromMillisecondsSinceEpoch(
-                              _messages[index - 1]['createdAt'] as int,
-                            );
-                      final newDay =
-                          previous == null ||
-                          date.year != previous.year ||
-                          date.month != previous.month ||
-                          date.day != previous.day;
-                      final today = DateTime.now();
-                      final dayLabel =
-                          date.year == today.year &&
-                              date.month == today.month &&
-                              date.day == today.day
-                          ? 'TODAY'
-                          : '${date.day} ${const ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'][date.month - 1]} ${date.year}';
-                      return Column(
-                        children: [
-                          if (newDay)
-                            Padding(
-                              padding: const EdgeInsets.only(
-                                top: 4,
-                                bottom: 22,
-                              ),
-                              child: Text(
-                                dayLabel,
-                                style: const TextStyle(
-                                  fontSize: 9,
-                                  letterSpacing: 2,
-                                  color: muted,
-                                ),
-                              ),
-                            ),
-                          MessageTile(
-                            message: message,
-                            mine: message['senderId'] == user['id'],
-                            api: _api!,
-                            receipt: (message['id'] as int) <= _partnerRead
-                                ? 'Read'
-                                : (message['id'] as int) <= _partnerDelivered
-                                ? 'Delivered'
-                                : 'Sent',
-                          ),
-                        ],
-                      );
-                    },
+                ? _emptyChat(c, topicName)
+                : _messageList(
+                    c,
+                    user['id'] as String,
+                    partner['name'] as String,
                   ),
           ),
           if (_uploadProgress != null)
-            LinearProgressIndicator(
-              value: _uploadProgress,
-              color: ink,
-              backgroundColor: sage,
-            ),
-          if (_partnerTyping)
-            Align(
-              alignment: Alignment.centerLeft,
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(22, 0, 22, 12),
-                child: Semantics(
-                  liveRegion: true,
-                  child: Text(
-                    '${partner['name']} is typing…',
-                    style: const TextStyle(
-                      color: muted,
-                      fontSize: 12,
-                      fontStyle: FontStyle.italic,
+            LinearProgressIndicator(value: _uploadProgress, minHeight: 2),
+          AnimatedSize(
+            duration: const Duration(milliseconds: 220),
+            curve: Curves.easeOutCubic,
+            alignment: Alignment.bottomLeft,
+            child: _partnerTyping
+                ? Align(
+                    alignment: Alignment.centerLeft,
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                      child: TypingBubble(name: partner['name'] as String),
                     ),
-                  ),
-                ),
-              ),
-            ),
-          Container(
-            decoration: const BoxDecoration(
-              color: cream,
-              border: Border(top: BorderSide(color: Color(0xFFE4E7DD))),
-            ),
-            child: SafeArea(
-              top: false,
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(10, 12, 16, 12),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: [
-                    PopupMenuButton<String>(
-                      enabled: !_busy,
-                      tooltip: 'Attach photo or video',
-                      onSelected: (value) => _pickAndUpload(value == 'video'),
-                      itemBuilder: (_) => const [
-                        PopupMenuItem(value: 'image', child: Text('Photo')),
-                        PopupMenuItem(value: 'video', child: Text('Video')),
-                      ],
-                      icon: const Icon(Icons.add_rounded, color: ink),
-                    ),
-                    Expanded(
-                      child: TextField(
-                        controller: _messageController,
-                        focusNode: _messageFocus,
-                        onChanged: _typingChanged,
-                        maxLines: 5,
-                        minLines: 1,
-                        maxLength: 5000,
-                        textCapitalization: TextCapitalization.sentences,
-                        textInputAction: TextInputAction.newline,
-                        decoration: InputDecoration(
-                          hintText: _topicId == 'general'
-                              ? 'A little message…'
-                              : 'Message in $topicName…',
-                          counterText: '',
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    IconButton.filled(
-                      tooltip: 'Send',
-                      onPressed: _busy ? null : _sendText,
-                      style: IconButton.styleFrom(
-                        fixedSize: const Size(48, 48),
-                        backgroundColor: ink,
-                      ),
-                      icon: _busy && _uploadProgress == null
-                          ? const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: cream,
-                              ),
-                            )
-                          : const Icon(Icons.arrow_upward_rounded, size: 22),
-                    ),
-                  ],
-                ),
-              ),
-            ),
+                  )
+                : const SizedBox(width: double.infinity),
+          ),
+          _composer(
+            c,
+            topicName,
+            user['id'] as String,
+            partner['name'] as String,
           ),
         ],
       ),
     );
   }
 
-  Widget _callBanner(String myId) {
+  Widget _topicBar(AidaColors c) => SizedBox(
+    height: 48,
+    child: Row(
+      children: [
+        Expanded(
+          child: ListView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.fromLTRB(16, 6, 4, 8),
+            children: [for (final topic in _topics) _topicPill(c, topic)],
+          ),
+        ),
+        IconButton(
+          tooltip: 'Create shared topic',
+          onPressed: _busy ? null : _createTopic,
+          icon: Icon(Icons.add_rounded, color: c.muted, size: 22),
+        ),
+        const SizedBox(width: 6),
+      ],
+    ),
+  );
+
+  Widget _topicPill(AidaColors c, Map<String, dynamic> topic) {
+    final selected = topic['id'] == _topicId;
+    return Padding(
+      padding: const EdgeInsets.only(right: 6),
+      child: Semantics(
+        selected: selected,
+        button: true,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          decoration: ShapeDecoration(
+            color: selected ? c.accentSoft : Colors.transparent,
+            shape: StadiumBorder(
+              side: BorderSide(color: selected ? Colors.transparent : c.border),
+            ),
+          ),
+          child: InkWell(
+            customBorder: const StadiumBorder(),
+            onTap: _busy || selected
+                ? null
+                : () => _switchTopic(topic['id'] as String),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 15),
+              child: Center(
+                child: Text(
+                  topic['name'] as String,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                    color: selected ? c.accent : c.muted,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _emptyChat(AidaColors c, String topicName) => Center(
+    child: SingleChildScrollView(
+      padding: const EdgeInsets.all(36),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            padding: const EdgeInsets.all(22),
+            decoration: BoxDecoration(
+              color: c.accentSoft,
+              shape: BoxShape.circle,
+            ),
+            child: Icon(
+              _topicId == 'general'
+                  ? Icons.chat_bubble_outline_rounded
+                  : Icons.auto_awesome_outlined,
+              size: 30,
+              color: c.accent,
+            ),
+          ),
+          const SizedBox(height: 22),
+          Text(
+            _topicId == 'general'
+                ? 'The little things belong here.'
+                : 'Let’s talk $topicName.',
+            textAlign: TextAlign.center,
+            style: TextStyle(fontFamily: serif, fontSize: 28, color: c.ink),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            _topicId == 'general'
+                ? 'A good morning. A passing thought.\nSomething that made you smile.'
+                : 'A shared topic for your ideas, photos, and plans.',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: c.muted, height: 1.7),
+          ),
+        ],
+      ),
+    ),
+  );
+
+  static DateTime _sentAt(Map<String, dynamic> message) =>
+      DateTime.fromMillisecondsSinceEpoch(message['createdAt'] as int);
+
+  static bool _sameDay(DateTime a, DateTime b) =>
+      a.year == b.year && a.month == b.month && a.day == b.day;
+
+  /// Consecutive messages from one person within a few minutes read as one
+  /// thought, so their bubbles are grouped.
+  static bool _joins(Map<String, dynamic> a, Map<String, dynamic> b) =>
+      a['senderId'] == b['senderId'] &&
+      _sameDay(_sentAt(a), _sentAt(b)) &&
+      (b['createdAt'] as int) - (a['createdAt'] as int) < 3 * 60 * 1000;
+
+  void _startReply(Map<String, dynamic> message) {
+    setState(() => _replyTo = message);
+    _messageFocus.requestFocus();
+  }
+
+  Future<void> _messageOptions(
+    Map<String, dynamic> message,
+    String author,
+  ) async {
+    HapticFeedback.mediumImpact();
+    final kind = message['kind'];
+    final sent = _sentAt(message);
+    final time =
+        '${sent.hour.toString().padLeft(2, '0')}:${sent.minute.toString().padLeft(2, '0')}';
+    final choice = await showModalBottomSheet<String>(
+      context: _navigatorKey.currentContext!,
+      showDragHandle: true,
+      builder: (context) {
+        final c = context.aida;
+        Widget option(IconData icon, String label, String value) => ListTile(
+          leading: Icon(icon, color: c.accent),
+          title: Text(label, style: TextStyle(color: c.ink, fontSize: 15.5)),
+          onTap: () => Navigator.pop(context, value),
+        );
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(24, 0, 24, 10),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '$author · $time',
+                      style: TextStyle(color: c.muted, fontSize: 12.5),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      messageSnippet(message),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(color: c.ink, fontSize: 15),
+                    ),
+                  ],
+                ),
+              ),
+              const Divider(height: 1),
+              const SizedBox(height: 6),
+              option(Icons.reply_rounded, 'Reply', 'reply'),
+              if (kind == 'text')
+                option(Icons.copy_rounded, 'Copy text', 'copy'),
+              if (kind == 'image')
+                option(Icons.open_in_full_rounded, 'View photo', 'view'),
+              if (kind == 'video')
+                option(Icons.play_circle_outline_rounded, 'Play video', 'view'),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
+    );
+    final navigator = _navigatorKey.currentContext;
+    if (!mounted || navigator == null || !navigator.mounted) return;
+    switch (choice) {
+      case 'reply':
+        _startReply(message);
+      case 'copy':
+        await Clipboard.setData(ClipboardData(text: message['text'] as String));
+        _messengerKey.currentState?.showSnackBar(
+          const SnackBar(content: Text('Copied')),
+        );
+      case 'view' when kind == 'image':
+        openPhoto(navigator, _api!, message['mediaId'] as String);
+      case 'view':
+        openVideo(navigator, _api!, message['mediaId'] as String);
+    }
+  }
+
+  /// Scrolls to the quoted message (building older parts of the list as
+  /// needed) and briefly highlights it.
+  Future<void> _jumpTo(int id) async {
+    if (!_messages.any((m) => m['id'] == id)) return;
+    final key = _messageKeys.putIfAbsent(id, GlobalKey.new);
+    for (var i = 0; i < 60 && key.currentContext == null; i++) {
+      if (!_scrollController.hasClients) return;
+      final position = _scrollController.position;
+      if (position.pixels >= position.maxScrollExtent) break;
+      _scrollController.jumpTo(
+        (position.pixels + position.viewportDimension * .8).clamp(
+          0,
+          position.maxScrollExtent,
+        ),
+      );
+      await WidgetsBinding.instance.endOfFrame;
+    }
+    final target = key.currentContext;
+    if (!mounted || target == null || !target.mounted) return;
+    await Scrollable.ensureVisible(
+      target,
+      alignment: .4,
+      duration: const Duration(milliseconds: 320),
+      curve: Curves.easeOutCubic,
+    );
+    if (!mounted) return;
+    setState(() => _highlightId = id);
+    _highlightTimer?.cancel();
+    _highlightTimer = Timer(const Duration(milliseconds: 1400), () {
+      if (mounted) setState(() => _highlightId = null);
+    });
+  }
+
+  Widget _replyBar(AidaColors c, String myId, String partnerName) {
+    final reply = _replyTo!;
+    final icon = snippetIcon(reply);
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 4, 12, 2),
+      padding: const EdgeInsets.fromLTRB(14, 8, 4, 8),
+      decoration: BoxDecoration(
+        color: c.surface,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: c.border),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.reply_rounded, size: 20, color: c.accent),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  reply['senderId'] == myId
+                      ? 'Replying to yourself'
+                      : 'Replying to $partnerName',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: c.accent,
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 1),
+                Row(
+                  children: [
+                    if (icon != null) ...[
+                      Icon(icon, size: 14, color: c.muted),
+                      const SizedBox(width: 4),
+                    ],
+                    Expanded(
+                      child: Text(
+                        messageSnippet(reply),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(color: c.muted, fontSize: 13),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          IconButton(
+            tooltip: 'Cancel reply',
+            onPressed: () => setState(() => _replyTo = null),
+            icon: Icon(Icons.close_rounded, size: 20, color: c.muted),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _messageList(AidaColors c, String myId, String partnerName) =>
+      ListView.builder(
+        controller: _scrollController,
+        // Reversed so the newest message stays put above the keyboard.
+        reverse: true,
+        keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+        padding: const EdgeInsets.fromLTRB(16, 10, 16, 6),
+        itemCount: _messages.length,
+        findChildIndexCallback: (key) {
+          final id = (key as ValueKey<int>).value;
+          final index = _messages.indexWhere((m) => m['id'] == id);
+          return index < 0 ? null : _messages.length - 1 - index;
+        },
+        itemBuilder: (context, position) {
+          final index = _messages.length - 1 - position;
+          final message = _messages[index];
+          final id = message['id'] as int;
+          final previous = index == 0 ? null : _messages[index - 1];
+          final next = index == _messages.length - 1
+              ? null
+              : _messages[index + 1];
+          final date = _sentAt(message);
+          final newDay = previous == null || !_sameDay(_sentAt(previous), date);
+          final mine = message['senderId'] == myId;
+          final quoted = message['replyTo'] as Map<String, dynamic>?;
+          final quotedId = message['replyToId'] as int?;
+          return Column(
+            key: ValueKey(id),
+            children: [
+              if (newDay) _dayLabel(c, date),
+              MessageTile(
+                key: _messageKeys.putIfAbsent(id, GlobalKey.new),
+                message: message,
+                mine: mine,
+                api: _api!,
+                highlighted: _highlightId == id,
+                quoteAuthor: quoted?['senderId'] == myId ? 'You' : partnerName,
+                onReply: () => _startReply(message),
+                onOptions: () =>
+                    _messageOptions(message, mine ? 'You' : partnerName),
+                onQuoteTap: quotedId == null ? null : () => _jumpTo(quotedId),
+                receipt: id <= _partnerRead
+                    ? 'Read'
+                    : id <= _partnerDelivered
+                    ? 'Delivered'
+                    : 'Sent',
+                joinsAbove: previous != null && _joins(previous, message),
+                joinsBelow: next != null && _joins(message, next),
+                animate: _freshIds.contains(id),
+              ),
+            ],
+          );
+        },
+      );
+
+  Widget _dayLabel(AidaColors c, DateTime date) {
+    const months = [
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
+    ];
+    final today = DateTime.now();
+    final label = _sameDay(date, today)
+        ? 'Today'
+        : _sameDay(date, today.subtract(const Duration(days: 1)))
+        ? 'Yesterday'
+        : '${date.day} ${months[date.month - 1]}'
+              '${date.year == today.year ? '' : ' ${date.year}'}';
+    return Padding(
+      padding: const EdgeInsets.only(top: 6, bottom: 16),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+        decoration: BoxDecoration(
+          color: c.surfaceMuted,
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 11.5,
+            color: c.muted,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _composer(
+    AidaColors c,
+    String topicName,
+    String myId,
+    String partnerName,
+  ) => SafeArea(
+    top: false,
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        AnimatedSize(
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeOutCubic,
+          child: _replyTo == null
+              ? const SizedBox(width: double.infinity)
+              : _replyBar(c, myId, partnerName),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(6, 4, 12, 10),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              PopupMenuButton<String>(
+                enabled: !_busy,
+                tooltip: 'Attach photo or video',
+                position: PopupMenuPosition.over,
+                onSelected: (value) => _pickAndUpload(value == 'video'),
+                itemBuilder: (_) => [
+                  PopupMenuItem(
+                    value: 'image',
+                    child: _menuRow(c, Icons.photo_outlined, 'Photo'),
+                  ),
+                  PopupMenuItem(
+                    value: 'video',
+                    child: _menuRow(c, Icons.videocam_outlined, 'Video'),
+                  ),
+                ],
+                icon: Icon(
+                  Icons.add_circle_outline_rounded,
+                  color: c.accent,
+                  size: 26,
+                ),
+              ),
+              Expanded(
+                child: TextField(
+                  controller: _messageController,
+                  focusNode: _messageFocus,
+                  onChanged: _typingChanged,
+                  maxLines: 5,
+                  minLines: 1,
+                  maxLength: 5000,
+                  textCapitalization: TextCapitalization.sentences,
+                  textInputAction: TextInputAction.newline,
+                  style: TextStyle(color: c.ink, fontSize: 15.5, height: 1.4),
+                  decoration: InputDecoration(
+                    hintText: _topicId == 'general'
+                        ? 'A little message…'
+                        : 'Message in $topicName…',
+                    counterText: '',
+                    isDense: true,
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 18,
+                      vertical: 13,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              ValueListenableBuilder<TextEditingValue>(
+                valueListenable: _messageController,
+                builder: (context, value, _) {
+                  final ready = value.text.trim().isNotEmpty;
+                  return AnimatedScale(
+                    scale: ready ? 1 : .9,
+                    duration: const Duration(milliseconds: 200),
+                    curve: Curves.easeOutBack,
+                    child: IconButton.filled(
+                      tooltip: 'Send',
+                      onPressed: _busy ? null : _sendText,
+                      style: IconButton.styleFrom(
+                        fixedSize: const Size(46, 46),
+                        backgroundColor: ready ? c.accent : c.accentSoft,
+                        foregroundColor: ready ? c.onAccent : c.accent,
+                        disabledBackgroundColor: c.accentSoft,
+                      ),
+                      icon: _busy && _uploadProgress == null
+                          ? SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: c.accent,
+                              ),
+                            )
+                          : const Icon(Icons.arrow_upward_rounded, size: 22),
+                    ),
+                  );
+                },
+              ),
+            ],
+          ),
+        ),
+      ],
+    ),
+  );
+
+  Widget _callBanner(AidaColors c, String myId) {
     final call = _call!;
     final incoming = call['initiatorId'] != myId;
     final active = call['state'] == 'active';
-    return Material(
-      color: Theme.of(context).colorScheme.primaryContainer,
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Row(
-          children: [
-            Icon(call['kind'] == 'video' ? Icons.videocam : Icons.call),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                active
-                    ? 'Call in progress'
-                    : incoming
-                    ? 'Incoming ${call['kind']} call'
-                    : 'Calling…',
-              ),
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+      padding: const EdgeInsets.fromLTRB(16, 6, 8, 6),
+      decoration: BoxDecoration(
+        color: c.hero,
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            call['kind'] == 'video'
+                ? Icons.videocam_rounded
+                : Icons.call_rounded,
+            color: c.warm,
+            size: 20,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              active
+                  ? 'Call in progress'
+                  : incoming
+                  ? 'Incoming ${call['kind']} call'
+                  : 'Calling…',
+              style: TextStyle(color: c.onHero),
             ),
-            if (active)
-              TextButton(onPressed: _openCall, child: const Text('Join'))
-            else if (incoming) ...[
-              TextButton(
-                onPressed: () => _callAction('decline'),
-                child: const Text('Decline'),
+          ),
+          if (active)
+            TextButton(
+              onPressed: _openCall,
+              style: TextButton.styleFrom(foregroundColor: c.warm),
+              child: const Text('Join'),
+            )
+          else if (incoming) ...[
+            TextButton(
+              onPressed: () => _callAction('decline'),
+              style: TextButton.styleFrom(
+                foregroundColor: c.onHero.withValues(alpha: .7),
               ),
-              FilledButton(
-                onPressed: () => _callAction('accept'),
-                child: const Text('Answer'),
+              child: const Text('Decline'),
+            ),
+            FilledButton(
+              onPressed: () => _callAction('accept'),
+              style: FilledButton.styleFrom(
+                backgroundColor: answerGreen,
+                foregroundColor: Colors.white,
+                minimumSize: const Size(48, 40),
               ),
-            ] else
-              TextButton(
-                onPressed: () => _callAction('end'),
-                child: const Text('Cancel'),
-              ),
-          ],
-        ),
+              child: const Text('Answer'),
+            ),
+          ] else
+            TextButton(
+              onPressed: () => _callAction('end'),
+              style: TextButton.styleFrom(foregroundColor: c.warm),
+              child: const Text('Cancel'),
+            ),
+        ],
       ),
     );
   }

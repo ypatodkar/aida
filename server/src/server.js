@@ -205,11 +205,28 @@ export function createApp(options = {}) {
   }
 
   function messageForClient(row) {
+    const quoted = row.reply_to_id == null ? null
+      : db.prepare('SELECT id, sender_id, kind, text FROM messages WHERE id = ? AND pair_id = ?')
+        .get(row.reply_to_id, row.pair_id);
     return {
       id: row.id, senderId: row.sender_id, clientId: row.client_id,
       kind: row.kind, text: row.text, mediaId: row.media_id, createdAt: row.created_at,
-      topicId: row.topic_id, pairId: row.pair_id,
+      topicId: row.topic_id, pairId: row.pair_id, replyToId: row.reply_to_id ?? null,
+      ...(quoted ? { replyTo: {
+        id: quoted.id, senderId: quoted.sender_id, kind: quoted.kind,
+        text: quoted.text == null ? null : quoted.text.slice(0, 280),
+      } } : {}),
     };
+  }
+
+  /** Validates an optional reply target; it must be in the same pair and topic. */
+  function replyTarget(pair, topicId, value) {
+    if (value === undefined || value === null || value === '') return null;
+    const id = Number(value);
+    const target = Number.isSafeInteger(id) && id > 0 &&
+      db.prepare('SELECT id FROM messages WHERE id = ? AND pair_id = ? AND topic_id = ?').get(id, pair.id, topicId);
+    if (!target) fail(400, 'invalid_reply', 'The message you replied to is unavailable');
+    return id;
   }
 
   function validateTopic(pair, topicId = 'general', expectedPairId) {
@@ -587,6 +604,7 @@ export function createApp(options = {}) {
       const clientId = String(body.clientId ?? '');
       if (text.length < 1 || text.length > 5000) fail(400, 'invalid_message', 'Message must be 1–5000 characters');
       if (!/^[A-Za-z0-9_-]{8,80}$/.test(clientId)) fail(400, 'invalid_message', 'Invalid message ID');
+      const replyToId = replyTarget(pair, topicId, body.replyToId);
       const existing = db.prepare('SELECT * FROM messages WHERE sender_id = ? AND client_id = ?')
         .get(user.id, clientId);
       if (existing) {
@@ -594,8 +612,8 @@ export function createApp(options = {}) {
         return send(response, 200, messageForClient(existing));
       }
       const id = db.prepare(
-        "INSERT INTO messages (pair_id, sender_id, client_id, kind, text, created_at, topic_id) VALUES (?, ?, ?, 'text', ?, ?, ?)"
-      ).run(pair.id, user.id, clientId, text, now(), topicId).lastInsertRowid;
+        "INSERT INTO messages (pair_id, sender_id, client_id, kind, text, created_at, topic_id, reply_to_id) VALUES (?, ?, ?, 'text', ?, ?, ?, ?)"
+      ).run(pair.id, user.id, clientId, text, now(), topicId, replyToId).lastInsertRowid;
       const message = db.prepare('SELECT * FROM messages WHERE id = ?').get(id);
       messageChanged(pair, user, message);
       return send(response, 201, messageForClient(message));
@@ -607,6 +625,7 @@ export function createApp(options = {}) {
       const mime = String(request.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
       const kind = MIME_KINDS.get(mime);
       if (!kind) fail(415, 'unsupported_media', 'Unsupported image or video type');
+      const replyToId = replyTarget(pair, topicId, request.headers['x-reply-to-id']);
       const declaredSize = Number(request.headers['content-length']);
       if (!Number.isSafeInteger(declaredSize) || declaredSize < 1 || declaredSize > MAX_MEDIA) {
         fail(413, 'too_large', 'File must be 1–100 MB');
@@ -636,8 +655,8 @@ export function createApp(options = {}) {
             'INSERT INTO media (id, pair_id, sender_id, mime, filename, size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
           ).run(id, pair.id, user.id, mime, filename, actual, created);
           const messageId = db.prepare(
-            'INSERT INTO messages (pair_id, sender_id, kind, media_id, created_at, topic_id) VALUES (?, ?, ?, ?, ?, ?)'
-          ).run(pair.id, user.id, kind, id, created, topicId).lastInsertRowid;
+            'INSERT INTO messages (pair_id, sender_id, kind, media_id, created_at, topic_id, reply_to_id) VALUES (?, ?, ?, ?, ?, ?, ?)'
+          ).run(pair.id, user.id, kind, id, created, topicId, replyToId).lastInsertRowid;
           return db.prepare('SELECT * FROM messages WHERE id = ?').get(messageId);
         });
         messageChanged(pair, user, message);

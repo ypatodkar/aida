@@ -92,12 +92,15 @@ class AidaApi {
   Future<Map<String, dynamic>> message(String id) =>
       _request('GET', '/v1/messages/$id');
 
+  /// A null [topicId] returns messages from every topic.
   Future<Map<String, dynamic>> messages({
     int after = 0,
-    String topicId = 'general',
+    String? topicId = 'general',
   }) => _request(
     'GET',
-    '/v1/messages?after=$after&topicId=${Uri.encodeComponent(topicId)}',
+    topicId == null
+        ? '/v1/messages?after=$after'
+        : '/v1/messages?after=$after&topicId=${Uri.encodeComponent(topicId)}',
   );
 
   Future<Map<String, dynamic>> sendMessage(
@@ -105,6 +108,7 @@ class AidaApi {
     String clientId, {
     String topicId = 'general',
     String? pairId,
+    int? replyToId,
   }) => _request(
     'POST',
     '/v1/messages',
@@ -113,6 +117,7 @@ class AidaApi {
       'clientId': clientId,
       'topicId': topicId,
       'pairId': ?pairId,
+      'replyToId': ?replyToId,
     },
   );
 
@@ -139,6 +144,7 @@ class AidaApi {
     String mime, {
     String topicId = 'general',
     String? pairId,
+    int? replyToId,
     void Function(double fraction)? onProgress,
   }) async {
     final length = await file.length();
@@ -147,6 +153,7 @@ class AidaApi {
     request.headers['content-type'] = mime;
     request.headers['x-topic-id'] = topicId;
     if (pairId != null) request.headers['x-pair-id'] = pairId;
+    if (replyToId != null) request.headers['x-reply-to-id'] = '$replyToId';
     request.headers['x-file-name'] = file.uri.pathSegments.last;
     request.headers['authorization'] = 'Bearer $token';
     final responseFuture = _client.send(request);

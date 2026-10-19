@@ -9,7 +9,13 @@ Aida lets each account have **one active partner**. Either person can disconnect
 - Backend integration tests for authentication, pairing races, media authorization/deletion, WebSocket delivery, and calls against local LiveKit.
 - AWS deployment: Node API, Caddy HTTPS, and self-hosted LiveKit on one Lightsail instance, with persistent chat storage and automatic certificate renewal.
 
-## Version 2 (current: 2.0.1, Android version code 3)
+## Version 2.1 (current: 2.1.0, Android version code 4)
+
+- Redesign: the conversation is the home screen, with Moments (days together, next milestone, and every shared photo/video across topics) and Us (partner, theme, accent colour, privacy, account controls) behind the header menu. Warm off-white and muted lavender, Instrument Serif headings, dark mode, and four accent choices (saved per device).
+- Replies: swipe a message right, or press and hold for Reply / Copy text / View photo. Replies quote the original; tap the quote to jump to it. The server stores `reply_to_id` (additive migration) and only accepts replies within the same connection and topic. 2.0.1 clients ignore the quote.
+- Notifications: no system notification for the conversation already on screen; a topic's notification clears once it is read in the app; the live socket and Firebase no longer alert twice for one message. Background push is configured end to end (Firebase Android app `1:379348658627:android:19659bc8b432dcb5e4f576`, server credential installed on AWS).
+
+## Version 2 (2.0.1, Android version code 3)
 
 - Topic-specific typing indicators over authenticated WebSockets, with throttling and automatic expiry on idle, backgrounding, or disconnect. Draft text is never transmitted as a typing event.
 - Online/last-seen status considers foreground devices, with heartbeat expiry for interrupted connections.
@@ -27,13 +33,13 @@ Aida lets each account have **one active partner**. Either person can disconnect
 
 **Previously verified on Android:** The dialing self-preview renders, camera video reaches a second client through AWS, camera capture stops after hangup, and a reply typed in an Android notification reaches the correct shared topic. Installing the signed v2 APK over v1 succeeds with the same original installation timestamp, and a secure-storage setting saved by v1 remains unchanged in v2.
 
-**Pending:** Real background push delivery requires the two Firebase configuration files below and device verification. Normal and forced-relay server media tests previously passed. See the test commands below for the v2 migration, topics, and notification-authorization checks.
+**Push status (2.1.0):** both Firebase files are in place and AWS sending is enabled. Delivery with the app swiped away still needs a check on both phones. Normal and forced-relay server media tests previously passed. See the test commands below for the v2 migration, topics, and notification-authorization checks.
 
 ### Install as an update
 
-Current signed APK: `build/releases/aida-v2.0.1.apk` (SHA-256 alongside it).
+Current signed APK: `build/releases/aida-v2.1.0.apk` (SHA-256 alongside it).
 
-The package remains `com.yashpatodkar.aida`, and the APK uses the same release signing key as version 1. Its version code is now 3, greater than both previous builds (1 and 2). **Install the new APK over the old app; do not uninstall, clear storage, or tap Disconnect.** Android preserves the existing secure-storage session and settings, and AWS preserves your pairing and conversation. An expired sign-in session can require signing in again with the same Google account; this does not end the server-side connection.
+The package remains `com.yashpatodkar.aida`, and the APK uses the same release signing key as version 1. Its version code is now 4, greater than all previous builds (1–3). **Install the new APK over the old app; do not uninstall, clear storage, or tap Disconnect.** Android preserves the existing secure-storage session and settings, and AWS preserves your pairing and conversation. An expired sign-in session can require signing in again with the same Google account; this does not end the server-side connection.
 
 ### Enable background notifications
 

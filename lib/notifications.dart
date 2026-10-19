@@ -19,6 +19,24 @@ const _defaultApi = String.fromEnvironment(
   defaultValue: 'https://44.209.97.214',
 );
 
+/// Whether a message event from the live socket should raise a system
+/// notification. Never for the conversation on screen; and while backgrounded,
+/// only when push is unavailable, because Firebase then delivers it and two
+/// paths would alert twice.
+bool socketShouldNotify({
+  required bool foreground,
+  required bool conversationVisible,
+  required bool pushActive,
+}) => !conversationVisible && (foreground || !pushActive);
+
+/// Whether a push that arrives while Aida is open should raise a notification.
+/// The live socket normally handles foreground messages; push only covers the
+/// moments it is reconnecting.
+bool foregroundPushShouldNotify({
+  required bool liveConnected,
+  required bool conversationVisible,
+}) => !liveConnected && !conversationVisible;
+
 int noticeId(String value) =>
     value.codeUnits.fold(7, (h, c) => ((h * 31) + c) & 0x7fffffff);
 int topicNoticeId(String pair, String topic) =>
@@ -177,7 +195,7 @@ Future<void> showRemoteEvent(Map<String, dynamic> data) async {
             'Messages',
             importance: Importance.high,
             priority: Priority.high,
-            color: const Color(0xFF234C43),
+            color: const Color(0xFF6B5BA5),
             visibility: NotificationVisibility.private,
             category: AndroidNotificationCategory.message,
             styleInformation: BigTextStyleInformation(preview),
@@ -259,6 +277,12 @@ class AidaNotifications {
   StreamSubscription? _messages;
   NotificationResponse? pending;
   void Function(NotificationResponse)? onTap;
+
+  /// Decides whether a push received while Aida is open is shown.
+  bool Function(Map<String, dynamic> data)? showInForeground;
+
+  /// Whether the server can reach this device when Aida is closed.
+  bool get pushActive => firebaseReady && serverReady;
   Future<void> initialize() async {
     await initializeLocalNotifications(
       onTap: (response) {
@@ -273,7 +297,8 @@ class AidaNotifications {
       firebaseReady = true;
       FirebaseMessaging.onBackgroundMessage(firebaseBackground);
       _messages = FirebaseMessaging.onMessage.listen((event) {
-        if (event.data['type'] == 'message') {
+        if (event.data['type'] == 'message' &&
+            (showInForeground?.call(event.data) ?? true)) {
           unawaited(showRemoteEvent(event.data));
         }
       });
