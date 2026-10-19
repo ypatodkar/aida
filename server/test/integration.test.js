@@ -429,3 +429,101 @@ test('replies quote a message from the same topic and connection', async t => {
   assert.equal((await f.request('/v1/messages', { method: 'POST', token: eve,
     body: { text: 'old quote', clientId: 'reply-old-pair', pairId: newPair, replyToId: original.id } })).status, 400);
 });
+
+test('reactions, edits, deletions, and Moments keeps sync through the change feed', async t => {
+  const pushed = [];
+  const f = await fixture(t, { sendPush: async (token, data) => { pushed.push(data); return true; } });
+  const alice = await f.login('actions-a@example.com');
+  const bob = await f.login('actions-b@example.com');
+  const invite = (await f.request('/v1/invites', { method: 'POST', token: alice })).value;
+  const paired = await f.request('/v1/invites/accept', { method: 'POST', token: bob, body: { code: invite.code } });
+  const pairId = paired.value.pair.id;
+  const bobId = (await f.request('/v1/me', { token: bob })).value.user.id;
+  const aliceId = (await f.request('/v1/me', { token: alice })).value.user.id;
+  await f.request('/v1/devices', { method: 'POST', token: alice, body: { token: 'alice-device-token-123456789' } });
+  const post = (token, text, clientId) => f.request('/v1/messages', { method: 'POST', token,
+    body: { text, clientId, pairId } }).then(r => r.value);
+  const hello = await post(alice, 'Hello there', 'actions-hello-1');
+  const photo = (await f.request('/v1/media', { method: 'POST', token: alice, body: new Uint8Array([1, 2, 3]),
+    headers: { 'content-type': 'image/png', 'x-pair-id': pairId } })).value;
+  const first = await f.request('/v1/messages?topicId=general', { token: bob });
+  const seq = first.value.changeSeq;
+  assert.equal(typeof seq, 'number');
+  assert.deepEqual(first.value.messages[0].reactions, []);
+  assert.equal(first.value.messages[0].kept, false);
+  assert.equal(first.value.messages[0].deleted, false);
+
+  // Reactions: one per person, replaceable, removable, from an allow-list.
+  const react = (token, id, emoji) => f.request(`/v1/messages/${id}/reaction`, { method: 'PUT', token, body: { emoji } });
+  assert.equal((await react(bob, hello.id, '❤️')).status, 200);
+  assert.equal((await react(bob, hello.id, '😂')).status, 200);
+  assert.equal((await react(bob, hello.id, '<script>')).status, 400);
+  const reacted = (await react(alice, hello.id, '👍')).value;
+  assert.deepEqual(reacted.reactions.map(r => [r.userId, r.emoji]).sort(),
+    [[aliceId, '👍'], [bobId, '😂']].sort());
+  assert.equal((await f.request(`/v1/messages/${hello.id}/reaction`, { method: 'DELETE', token: alice })).status, 200);
+  await new Promise(resolve => setTimeout(resolve, 2300));
+  assert.ok(pushed.some(p => p.type === 'reaction' && p.messageId === String(hello.id)),
+    'the author is told about a reaction');
+  assert.ok(pushed.every(p => !JSON.stringify(p).includes('Hello there')), 'pushes carry no message text');
+
+  // Keeping a message is shared and listed in Moments, newest first.
+  assert.equal((await f.request(`/v1/messages/${photo.id}/keep`, { method: 'PUT', token: bob })).status, 200);
+  assert.equal((await f.request(`/v1/messages/${hello.id}/keep`, { method: 'PUT', token: alice })).status, 200);
+  const kept = (await f.request('/v1/kept', { token: bob })).value.kept;
+  assert.deepEqual(kept.map(m => m.id), [hello.id, photo.id]);
+  assert.equal(kept[0].topicName, 'Everyday');
+  assert.equal((await f.request(`/v1/messages/${hello.id}/keep`, { method: 'DELETE', token: bob })).status, 200);
+  assert.deepEqual((await f.request('/v1/kept', { token: alice })).value.kept.map(m => m.id), [photo.id]);
+
+  // Only the author edits or deletes; edits are marked.
+  const edit = (token, id, text) => f.request(`/v1/messages/${id}`, { method: 'PATCH', token, body: { text } });
+  assert.equal((await edit(bob, hello.id, 'Hijacked')).status, 403);
+  assert.equal((await edit(alice, photo.id, 'Not text')).status, 400);
+  assert.equal((await edit(alice, hello.id, '')).status, 400);
+  const edited = (await edit(alice, hello.id, 'Hello, love')).value;
+  assert.equal(edited.text, 'Hello, love');
+  assert.equal(typeof edited.editedAt, 'number');
+  assert.equal((await f.request(`/v1/messages/${photo.id}`, { method: 'DELETE', token: bob })).status, 403);
+
+  // The change feed carries every update since the cursor, once, in order.
+  const changes = (await f.request(`/v1/messages/changes?since=${seq}&topicId=general`, { token: bob })).value;
+  assert.deepEqual(changes.messages.map(m => m.id).sort(), [hello.id, photo.id].sort());
+  assert.equal(changes.messages.find(m => m.id === hello.id).text, 'Hello, love');
+  assert.equal(changes.hasMore, false);
+  const none = (await f.request(`/v1/messages/changes?since=${changes.seq}&topicId=general`, { token: bob })).value;
+  assert.deepEqual(none.messages, []);
+  assert.equal((await f.request('/v1/messages/changes?since=-1&topicId=general', { token: bob })).status, 400);
+
+  // Deleting removes the content and file for both, leaves a tombstone, and updates quotes.
+  const reply = (await f.request('/v1/messages', { method: 'POST', token: bob,
+    body: { text: 'Gorgeous', clientId: 'actions-reply-1', pairId, replyToId: photo.id } })).value;
+  const mediaFile = join(f.dataDir, 'media', pairId, photo.mediaId);
+  assert.ok(existsSync(mediaFile));
+  const deleted = await f.request(`/v1/messages/${photo.id}`, { method: 'DELETE', token: alice });
+  assert.equal(deleted.status, 200);
+  assert.equal(deleted.value.deleted, true);
+  assert.equal(deleted.value.mediaId, null);
+  assert.ok(!existsSync(mediaFile));
+  assert.equal((await f.request(`/v1/media/${photo.mediaId}`, { token: bob })).status, 404);
+  assert.equal((await f.request(`/v1/messages/${reply.id}`, { token: bob })).value.replyTo.deleted, true);
+  assert.deepEqual((await f.request('/v1/kept', { token: bob })).value.kept, []);
+  assert.equal((await react(bob, photo.id, '❤️')).status, 409);
+  assert.equal((await f.request(`/v1/messages/${photo.id}`, { method: 'DELETE', token: alice })).status, 200);
+  const after = (await f.request(`/v1/messages/changes?since=${changes.seq}&topicId=general`, { token: bob })).value;
+  assert.ok(after.messages.some(m => m.id === photo.id && m.deleted && m.text === null));
+  assert.ok(after.messages.some(m => m.id === reply.id && m.replyTo.deleted), 'quotes of it refresh too');
+  await new Promise(resolve => setTimeout(resolve, 2300));
+
+  // Another connection cannot touch these messages; disconnect erases everything.
+  const eve = await f.login('actions-e@example.com');
+  assert.equal((await react(eve, hello.id, '❤️')).status, 409);
+  await react(bob, hello.id, '🔥');
+  await f.request(`/v1/messages/${hello.id}/keep`, { method: 'PUT', token: bob });
+  await f.request('/v1/pair', { method: 'DELETE', token: bob });
+  const db = new DatabaseSync(join(f.dataDir, 'aida.sqlite'));
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM reactions').get().n, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM kept').get().n, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 0);
+  db.close();
+});

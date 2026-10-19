@@ -12,6 +12,7 @@ import { createPushSender, createPushQueue } from './push.js';
 
 const MAX_JSON = 32 * 1024;
 const MAX_MEDIA = 100 * 1024 * 1024;
+const REACTIONS = new Set(['❤️', '😂', '😮', '😢', '👍', '🔥']);
 const INVITE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const MIME_KINDS = new Map([
   ['image/jpeg', 'image'], ['image/png', 'image'], ['image/webp', 'image'],
@@ -206,17 +207,46 @@ export function createApp(options = {}) {
 
   function messageForClient(row) {
     const quoted = row.reply_to_id == null ? null
-      : db.prepare('SELECT id, sender_id, kind, text FROM messages WHERE id = ? AND pair_id = ?')
+      : db.prepare('SELECT id, sender_id, kind, text, deleted_at FROM messages WHERE id = ? AND pair_id = ?')
         .get(row.reply_to_id, row.pair_id);
+    const reactions = db.prepare('SELECT user_id, emoji FROM reactions WHERE message_id = ? ORDER BY created_at')
+      .all(row.id).map(r => ({ userId: r.user_id, emoji: r.emoji }));
+    const kept = db.prepare('SELECT user_id FROM kept WHERE message_id = ?').get(row.id);
     return {
       id: row.id, senderId: row.sender_id, clientId: row.client_id,
       kind: row.kind, text: row.text, mediaId: row.media_id, createdAt: row.created_at,
       topicId: row.topic_id, pairId: row.pair_id, replyToId: row.reply_to_id ?? null,
+      editedAt: row.edited_at ?? null, deleted: row.deleted_at != null,
+      reactions, kept: Boolean(kept), keptBy: kept?.user_id ?? null,
       ...(quoted ? { replyTo: {
         id: quoted.id, senderId: quoted.sender_id, kind: quoted.kind,
         text: quoted.text == null ? null : quoted.text.slice(0, 280),
+        ...(quoted.deleted_at != null ? { deleted: true } : {}),
       } } : {}),
     };
+  }
+
+  /** Highest change number in a pair; clients resume the change feed from it. */
+  function changeSeq(pairId) {
+    return db.prepare('SELECT COALESCE(MAX(updated_seq), 0) AS seq FROM messages WHERE pair_id = ?').get(pairId).seq;
+  }
+
+  /** Marks a message as changed so the change feed delivers it again. */
+  function bump(pairId, messageId) {
+    db.prepare(`UPDATE messages SET updated_seq =
+      (SELECT COALESCE(MAX(updated_seq), 0) + 1 FROM messages WHERE pair_id = ?) WHERE id = ?`).run(pairId, messageId);
+  }
+
+  /** Replies embed a quote of the original, so they change when it does. */
+  function bumpReplies(pairId, messageId) {
+    for (const reply of db.prepare('SELECT id FROM messages WHERE pair_id = ? AND reply_to_id = ?').all(pairId, messageId)) {
+      bump(pairId, reply.id);
+    }
+  }
+
+  function messageUpdated(pair, message) {
+    notify([pair.a_id, pair.b_id], 'message_updated',
+      { pairId: pair.id, topicId: message.topic_id, messageId: String(message.id) });
   }
 
   /** Validates an optional reply target; it must be in the same pair and topic. */
@@ -507,6 +537,8 @@ export function createApp(options = {}) {
       transaction(db, () => {
         db.prepare('UPDATE users SET pair_id = NULL WHERE id IN (?, ?) AND pair_id = ?')
           .run(pair.a_id, pair.b_id, pair.id);
+        db.prepare('DELETE FROM reactions WHERE pair_id = ?').run(pair.id);
+        db.prepare('DELETE FROM kept WHERE pair_id = ?').run(pair.id);
         db.prepare('DELETE FROM messages WHERE pair_id = ?').run(pair.id);
         db.prepare('DELETE FROM media WHERE pair_id = ?').run(pair.id);
         db.prepare('DELETE FROM calls WHERE pair_id = ?').run(pair.id);
@@ -554,8 +586,122 @@ export function createApp(options = {}) {
       const topic = db.prepare('SELECT name FROM topics WHERE id = ? AND pair_id = ?').get(message.topic_id, pair.id);
       return send(response, 200, { ...messageForClient(message), senderName: sender.name, topicName: topic?.name ?? 'Everyday' });
     }
+    if (method === 'GET' && path === '/v1/messages/changes') {
+      const pair = currentPair(user);
+      const since = Number(url.searchParams.get('since') ?? 0);
+      if (!Number.isSafeInteger(since) || since < 0) fail(400, 'bad_cursor', 'Invalid change cursor');
+      const topic = validateTopic(pair, url.searchParams.get('topicId') ?? 'general');
+      const current = changeSeq(pair.id);
+      const rows = db.prepare(
+        'SELECT * FROM messages WHERE pair_id = ? AND topic_id = ? AND updated_seq > ? ORDER BY updated_seq ASC LIMIT 201'
+      ).all(pair.id, topic, since);
+      const page = rows.slice(0, 200);
+      const hasMore = rows.length > 200;
+      return send(response, 200, {
+        messages: page.map(messageForClient), hasMore,
+        seq: hasMore ? page.at(-1).updated_seq : current,
+      });
+    }
+    if (method === 'GET' && path === '/v1/kept') {
+      const pair = currentPair(user);
+      const rows = db.prepare(`SELECT m.*, k.created_at AS kept_at, t.name AS topic_name FROM kept k
+        JOIN messages m ON m.id = k.message_id LEFT JOIN topics t ON t.id = m.topic_id AND t.pair_id = m.pair_id
+        WHERE k.pair_id = ? AND m.deleted_at IS NULL ORDER BY k.created_at DESC, k.message_id DESC LIMIT 500`).all(pair.id);
+      return send(response, 200, { kept: rows.map(row => ({
+        ...messageForClient(row), keptAt: row.kept_at, topicName: row.topic_name ?? 'Everyday',
+      })) });
+    }
+    const actionMatch = /^\/v1\/messages\/(\d+)(?:\/(reaction|keep))?$/.exec(path);
+    if (actionMatch && ['PATCH', 'PUT', 'DELETE'].includes(method)) {
+      const pair = currentPair(user);
+      const id = Number(actionMatch[1]);
+      const action = actionMatch[2] ?? 'message';
+      const message = db.prepare('SELECT * FROM messages WHERE id = ? AND pair_id = ?').get(id, pair.id);
+      if (!message) fail(404, 'not_found', 'Message unavailable');
+      const reload = () => messageForClient(db.prepare('SELECT * FROM messages WHERE id = ?').get(id));
+      const own = () => {
+        if (message.sender_id !== user.id) fail(403, 'not_yours', 'Only the sender can change this message');
+      };
+      const alive = () => {
+        if (message.deleted_at != null) fail(409, 'message_deleted', 'This message was deleted');
+      };
+      const change = (apply) => {
+        const changed = transaction(db, () => {
+          const result = apply();
+          if (result) bump(pair.id, id);
+          return result;
+        });
+        if (changed) messageUpdated(pair, message);
+        return changed;
+      };
+
+      if (action === 'message' && method === 'PATCH') {
+        own(); alive();
+        if (message.kind !== 'text') fail(400, 'not_text', 'Only text messages can be edited');
+        const body = await readJson(request);
+        const text = String(body.text ?? '').trim();
+        if (text.length < 1 || text.length > 5000) fail(400, 'invalid_message', 'Message must be 1–5000 characters');
+        change(() => {
+          if (text === message.text) return false;
+          db.prepare('UPDATE messages SET text = ?, edited_at = ? WHERE id = ?').run(text, now(), id);
+          bumpReplies(pair.id, id);
+          return true;
+        });
+        return send(response, 200, reload());
+      }
+      if (action === 'message' && method === 'DELETE') {
+        own();
+        const removed = change(() => {
+          if (message.deleted_at != null) return false;
+          db.prepare('DELETE FROM reactions WHERE message_id = ?').run(id);
+          db.prepare('DELETE FROM kept WHERE message_id = ?').run(id);
+          db.prepare('UPDATE messages SET text = NULL, media_id = NULL, deleted_at = ? WHERE id = ?').run(now(), id);
+          if (message.media_id) db.prepare('DELETE FROM media WHERE id = ? AND pair_id = ?').run(message.media_id, pair.id);
+          bumpReplies(pair.id, id);
+          return true;
+        });
+        if (removed) {
+          if (message.media_id) {
+            try { rmSync(join(mediaDir, pair.id, message.media_id), { force: true }); }
+            catch (error) { console.error('Deleted message media could not be removed:', error.message); }
+          }
+          pushes.enqueue([otherId(pair, user.id)],
+            { type: 'message_deleted', pairId: pair.id, topicId: message.topic_id, messageId: String(id) });
+        }
+        return send(response, 200, reload());
+      }
+      if (action === 'reaction' && method === 'PUT') {
+        alive();
+        const body = await readJson(request);
+        if (!REACTIONS.has(body.emoji)) fail(400, 'invalid_reaction', 'Unsupported reaction');
+        const changed = change(() => db.prepare(`INSERT INTO reactions (message_id, pair_id, user_id, emoji, created_at)
+          VALUES (?, ?, ?, ?, ?) ON CONFLICT(message_id, user_id)
+          DO UPDATE SET emoji = excluded.emoji, created_at = excluded.created_at WHERE emoji != excluded.emoji`)
+          .run(id, pair.id, user.id, body.emoji, now()).changes > 0);
+        if (changed && message.sender_id !== user.id) {
+          pushes.enqueue([message.sender_id],
+            { type: 'reaction', pairId: pair.id, topicId: message.topic_id, messageId: String(id) });
+        }
+        return send(response, 200, reload());
+      }
+      if (action === 'reaction' && method === 'DELETE') {
+        change(() => db.prepare('DELETE FROM reactions WHERE message_id = ? AND user_id = ?').run(id, user.id).changes > 0);
+        return send(response, 200, reload());
+      }
+      if (action === 'keep' && method === 'PUT') {
+        alive();
+        change(() => db.prepare('INSERT OR IGNORE INTO kept (message_id, pair_id, user_id, created_at) VALUES (?, ?, ?, ?)')
+          .run(id, pair.id, user.id, now()).changes > 0);
+        return send(response, 200, reload());
+      }
+      if (action === 'keep' && method === 'DELETE') {
+        change(() => db.prepare('DELETE FROM kept WHERE message_id = ?').run(id).changes > 0);
+        return send(response, 200, reload());
+      }
+    }
     if (method === 'GET' && path === '/v1/messages') {
       const pair = currentPair(user);
+      const changes = changeSeq(pair.id);
       const after = Number(url.searchParams.get('after') ?? 0);
       if (!Number.isSafeInteger(after) || after < 0) fail(400, 'bad_cursor', 'Invalid message cursor');
       const topic = url.searchParams.get('topicId');
@@ -564,7 +710,7 @@ export function createApp(options = {}) {
         ? db.prepare('SELECT * FROM messages WHERE pair_id = ? AND id > ? ORDER BY id ASC LIMIT 101').all(pair.id, after)
         : db.prepare('SELECT * FROM messages WHERE pair_id = ? AND topic_id = ? AND id > ? ORDER BY id ASC LIMIT 101').all(pair.id, topic, after);
       return send(response, 200, {
-        messages: rows.slice(0, 100).map(messageForClient), hasMore: rows.length > 100,
+        messages: rows.slice(0, 100).map(messageForClient), hasMore: rows.length > 100, changeSeq: changes,
         partnerReceipt: receipt(pair.id, otherId(pair, user.id), topic ?? 'general'),
       });
     }

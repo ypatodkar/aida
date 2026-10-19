@@ -41,6 +41,8 @@ int noticeId(String value) =>
     value.codeUnits.fold(7, (h, c) => ((h * 31) + c) & 0x7fffffff);
 int topicNoticeId(String pair, String topic) =>
     noticeId('message:$pair:$topic');
+int reactionNoticeId(String pair, String message) =>
+    noticeId('reaction:$pair:$message');
 
 @pragma('vm:entry-point')
 Future<void> firebaseBackground(RemoteMessage message) async {
@@ -167,9 +169,67 @@ Future<void> showRemoteEvent(Map<String, dynamic> data) async {
       return;
     }
     if (pair?['id'] != data['pairId']) return;
+    if (data['type'] == 'message_deleted') {
+      // Take down anything that still shows the deleted message.
+      final pairId = data['pairId'] as String;
+      final messageId = data['messageId'].toString();
+      await _notices.cancel(id: reactionNoticeId(pairId, messageId));
+      final seenKey = 'notice_${pairId}_${data['topicId']}';
+      if (await _storage.read(key: seenKey) == messageId) {
+        await _notices.cancel(
+          id: topicNoticeId(pairId, data['topicId'] as String),
+        );
+      }
+      return;
+    }
+    if (data['type'] == 'reaction') {
+      final pairId = data['pairId'] as String;
+      final item = await api.message(data['messageId'].toString());
+      final myId = (state['user'] as Map)['id'];
+      final id = reactionNoticeId(pairId, item['id'].toString());
+      final reaction = ((item['reactions'] as List?) ?? const [])
+          .cast<Map<String, dynamic>>()
+          .where((r) => r['userId'] != myId)
+          .firstOrNull;
+      if (item['senderId'] != myId ||
+          item['deleted'] == true ||
+          reaction == null) {
+        await _notices.cancel(id: id);
+        return;
+      }
+      final name = (pair!['partner'] as Map)['name'] as String;
+      final about = switch (item['kind']) {
+        'image' => 'your photo',
+        'video' => 'your video',
+        _ => '“${(item['text'] as String).replaceAll(RegExp(r'\s+'), ' ')}”',
+      };
+      await _notices.show(
+        id: id,
+        title: '$name reacted ${reaction['emoji']}',
+        body: 'to $about',
+        payload: jsonEncode({
+          'type': 'message',
+          'pairId': pairId,
+          'topicId': item['topicId'],
+        }),
+        notificationDetails: NotificationDetails(
+          android: AndroidNotificationDetails(
+            'aida_messages_v2',
+            'Messages',
+            importance: Importance.defaultImportance,
+            color: const Color(0xFF6B5BA5),
+            visibility: NotificationVisibility.private,
+            category: AndroidNotificationCategory.social,
+            onlyAlertOnce: true,
+          ),
+        ),
+      );
+      return;
+    }
     if (data['type'] == 'message') {
       final item = await api.message(data['messageId'].toString());
       if (item['senderId'] == (state['user'] as Map)['id']) return;
+      if (item['deleted'] == true) return;
       final topicId = item['topicId'] as String;
       final seenKey = 'notice_${data['pairId']}_$topicId';
       final last = int.tryParse(await _storage.read(key: seenKey) ?? '') ?? 0;
@@ -297,7 +357,9 @@ class AidaNotifications {
       firebaseReady = true;
       FirebaseMessaging.onBackgroundMessage(firebaseBackground);
       _messages = FirebaseMessaging.onMessage.listen((event) {
-        if (event.data['type'] == 'message' &&
+        if (event.data['type'] == 'message_deleted') {
+          unawaited(showRemoteEvent(event.data));
+        } else if (event.data['type'] == 'message' &&
             (showInForeground?.call(event.data) ?? true)) {
           unawaited(showRemoteEvent(event.data));
         }

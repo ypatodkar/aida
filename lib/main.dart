@@ -6,9 +6,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:gal/gal.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:uuid/uuid.dart';
 import 'package:web_socket_channel/io.dart';
@@ -41,7 +43,7 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
   );
   static const _preview =
       kDebugMode && bool.fromEnvironment('AIDA_DESIGN_PREVIEW');
-  static const _version = 'Aida 2.1.0';
+  static const _version = 'Aida 2.2.0';
 
   final _nameController = TextEditingController();
   final _inviteController = TextEditingController();
@@ -99,6 +101,14 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
   int? _highlightId;
   Timer? _highlightTimer;
   final Map<int, GlobalKey> _messageKeys = {};
+
+  /// Change-feed cursor for the open topic; null until it first loads.
+  int? _changeSeq;
+
+  /// The message being edited in the composer, and the draft it set aside.
+  Map<String, dynamic>? _editing;
+  String _draftBeforeEdit = '';
+  String? _uploadLabel;
 
   @override
   void initState() {
@@ -166,6 +176,8 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
           'kind': 'text',
           'text': 'Saving you a seat for when you get here.',
           'createdAt': DateTime.now().millisecondsSinceEpoch - 120000,
+          'kept': true,
+          'keptBy': 'me',
         },
         {
           'id': 3,
@@ -180,6 +192,10 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
           'kind': 'text',
           'text': 'Just because you’re there.',
           'createdAt': DateTime.now().millisecondsSinceEpoch - 60000,
+          'editedAt': DateTime.now().millisecondsSinceEpoch - 50000,
+          'reactions': [
+            {'userId': 'them', 'emoji': '❤️'},
+          ],
         },
         {
           'id': 6,
@@ -236,6 +252,7 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
 
   void _typingChanged(String text) {
     if (!_foreground ||
+        _editing != null ||
         !_messageFocus.hasFocus ||
         _loadedPairId == null ||
         text.trim().isEmpty) {
@@ -397,6 +414,8 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
       _freshIds.clear();
       _messageKeys.clear();
       _replyTo = null;
+      _editing = null;
+      _changeSeq = null;
     });
     if (_loadedPairId != null) {
       await _storage.write(key: 'topic_$_loadedPairId', value: id);
@@ -522,6 +541,8 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
         _freshIds.clear();
         _messageKeys.clear();
         _replyTo = null;
+        _editing = null;
+        _changeSeq = null;
         _call = null;
         _loadedPairId = pairId;
         _topicId = pairId == null
@@ -592,7 +613,8 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
         _messages.isEmpty ||
         !_scrollController.hasClients ||
         _scrollController.position.pixels < 80;
-    var cursor = _messages.isEmpty ? 0 : _messages.last['id'] as int;
+    final fromScratch = _messages.isEmpty;
+    var cursor = fromScratch ? 0 : _messages.last['id'] as int;
     while (true) {
       final page = await api.messages(after: cursor, topicId: topicId);
       if (!mounted ||
@@ -600,6 +622,7 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
           pairId != _loadedPairId) {
         return;
       }
+      if (fromScratch && cursor == 0) _changeSeq = page['changeSeq'] as int?;
       final items = (page['messages'] as List).cast<Map<String, dynamic>>();
       final receipt = page['partnerReceipt'] as Map<String, dynamic>?;
       if (receipt != null) setState(() => _applyReceipt(receipt));
@@ -626,11 +649,39 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
       }
       if (page['hasMore'] != true || items.isEmpty) break;
     }
+    await _syncChanges(generation, topicId, pairId);
+    if (!mounted || generation != _messageGeneration) return;
     // Delivery is independent of rendering; a background sync is not a read.
     await _ackMessages(allowRead: false);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted && generation == _messageGeneration) _ackVisibleMessages();
     });
+  }
+
+  /// Applies edits, deletions, reactions, and keeps made since the last sync.
+  Future<void> _syncChanges(
+    int generation,
+    String topicId,
+    String? pairId,
+  ) async {
+    var since = _changeSeq;
+    // Servers before 2.2 have no change feed.
+    if (since == null) return;
+    while (true) {
+      final page = await _api!.changes(since: since!, topicId: topicId);
+      if (!mounted ||
+          generation != _messageGeneration ||
+          pairId != _loadedPairId) {
+        return;
+      }
+      final items = (page['messages'] as List).cast<Map<String, dynamic>>();
+      for (final item in items) {
+        _replaceMessage(item);
+      }
+      since = page['seq'] as int;
+      _changeSeq = since;
+      if (page['hasMore'] != true) break;
+    }
   }
 
   void _connectLive() {
@@ -944,53 +995,194 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
     }
   });
 
-  Future<void> _pickAndUpload(bool video) => _run(() async {
+  /// The sheet behind the composer's "+": camera, video, or gallery.
+  Future<void> _attach(String partnerName, String topicName) async {
+    _messageFocus.unfocus();
+    final choice = await showModalBottomSheet<String>(
+      context: _navigatorKey.currentContext!,
+      builder: (context) {
+        final c = context.aida;
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Share with $partnerName',
+                  style: TextStyle(
+                    fontFamily: serif,
+                    fontSize: 28,
+                    color: c.ink,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  'In $topicName',
+                  style: TextStyle(color: c.muted, fontSize: 13),
+                ),
+                const SizedBox(height: 18),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _AttachTile(
+                        icon: Icons.photo_camera_rounded,
+                        label: 'Camera',
+                        caption: 'Take a photo',
+                        tint: c.accent,
+                        onTap: () => Navigator.pop(context, 'camera'),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: _AttachTile(
+                        icon: Icons.videocam_rounded,
+                        label: 'Video',
+                        caption: 'Record a clip',
+                        tint: c.warm,
+                        onTap: () => Navigator.pop(context, 'video'),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: _AttachTile(
+                        icon: Icons.photo_library_rounded,
+                        label: 'Gallery',
+                        caption: 'Up to 10 at once',
+                        tint: c.online,
+                        onTap: () => Navigator.pop(context, 'gallery'),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+    switch (choice) {
+      case 'camera':
+        await _capture(video: false);
+      case 'video':
+        await _capture(video: true);
+      case 'gallery':
+        await _pickGallery();
+    }
+  }
+
+  /// Opens the phone's own camera app; photos are resized like gallery picks
+  /// so they send quickly.
+  Future<void> _capture({required bool video}) async {
+    if (_busy) return;
+    final XFile? picked;
+    try {
+      picked = video
+          ? await _picker.pickVideo(
+              source: ImageSource.camera,
+              maxDuration: const Duration(minutes: 1),
+            )
+          : await _picker.pickImage(
+              source: ImageSource.camera,
+              maxWidth: 2560,
+              maxHeight: 2560,
+              imageQuality: 85,
+            );
+    } on PlatformException catch (error) {
+      _showError(
+        FormatException(
+          error.code == 'camera_access_denied'
+              ? 'Allow camera access for Aida in Android settings.'
+              : 'The camera couldn’t open.',
+        ),
+      );
+      return;
+    }
+    if (picked != null) await _uploadFiles([picked]);
+  }
+
+  Future<void> _pickGallery() async {
+    if (_busy) return;
+    final picked = await _picker.pickMultipleMedia(
+      limit: 10,
+      maxWidth: 2560,
+      maxHeight: 2560,
+      imageQuality: 85,
+    );
+    if (picked.isNotEmpty) await _uploadFiles(picked);
+  }
+
+  static String _mimeOf(XFile file) {
+    final declared = file.mimeType;
+    if (declared != null && declared.isNotEmpty) return declared;
+    return switch (file.name.toLowerCase().split('.').last) {
+      'jpg' || 'jpeg' => 'image/jpeg',
+      'png' => 'image/png',
+      'webp' => 'image/webp',
+      'gif' => 'image/gif',
+      'mp4' => 'video/mp4',
+      'webm' => 'video/webm',
+      'mov' => 'video/quicktime',
+      _ => '',
+    };
+  }
+
+  /// Sends each file in turn. A reply in progress attaches to the first.
+  Future<void> _uploadFiles(List<XFile> files) => _run(() async {
     final uploadPair = _loadedPairId;
     final uploadTopic = _topicId;
-    final reply = _replyTo;
-    final picked = video
-        ? await _picker.pickVideo(source: ImageSource.gallery)
-        : await _picker.pickImage(source: ImageSource.gallery);
-    if (picked == null) return;
-    final file = File(picked.path);
-    final size = await file.length();
-    if (size > 100 * 1024 * 1024) {
-      throw const FormatException('Choose a file under 100 MB');
-    }
-    var mime = picked.mimeType;
-    if (mime == null || mime.isEmpty) {
-      final extension = picked.name.toLowerCase().split('.').last;
-      mime = switch (extension) {
-        'jpg' || 'jpeg' => 'image/jpeg',
-        'png' => 'image/png',
-        'webp' => 'image/webp',
-        'gif' => 'image/gif',
-        'mp4' => 'video/mp4',
-        'webm' => 'video/webm',
-        'mov' => 'video/quicktime',
-        _ => '',
-      };
-    }
-    if (mime.isEmpty) throw const FormatException('Unsupported image or video');
-    setState(() => _uploadProgress = 0);
+    var reply = _replyTo;
+    final skipped = <String>[];
     try {
-      await _api!.upload(
-        file,
-        mime,
-        topicId: uploadTopic,
-        pairId: uploadPair,
-        replyToId: reply?['id'] as int?,
-        onProgress: (fraction) {
-          if (mounted) setState(() => _uploadProgress = fraction);
-        },
-      );
-      if (mounted && identical(_replyTo, reply)) {
-        setState(() => _replyTo = null);
+      for (var i = 0; i < files.length; i++) {
+        final picked = files[i];
+        final file = File(picked.path);
+        final mime = _mimeOf(picked);
+        if (mime.isEmpty) {
+          skipped.add('${picked.name} isn’t a photo or video Aida can send.');
+          continue;
+        }
+        if (await file.length() > 100 * 1024 * 1024) {
+          skipped.add(
+            mime.startsWith('video/')
+                ? 'A video was over 100 MB. Try a shorter clip.'
+                : '${picked.name} is over 100 MB.',
+          );
+          continue;
+        }
+        final kind = mime.startsWith('video/') ? 'video' : 'photo';
+        setState(() {
+          _uploadProgress = 0;
+          _uploadLabel = files.length > 1
+              ? 'Sending ${i + 1} of ${files.length}…'
+              : 'Sending $kind…';
+        });
+        await _api!.upload(
+          file,
+          mime,
+          topicId: uploadTopic,
+          pairId: uploadPair,
+          replyToId: reply?['id'] as int?,
+          onProgress: (fraction) {
+            if (mounted) setState(() => _uploadProgress = fraction);
+          },
+        );
+        if (mounted && identical(_replyTo, reply) && reply != null) {
+          setState(() => _replyTo = null);
+        }
+        reply = null;
+        await _loadMessages();
       }
-      await _loadMessages();
     } finally {
-      if (mounted) setState(() => _uploadProgress = null);
+      if (mounted) {
+        setState(() {
+          _uploadProgress = null;
+          _uploadLabel = null;
+        });
+      }
     }
+    if (skipped.isNotEmpty) throw FormatException(skipped.join('\n'));
   });
 
   Future<void> _startCall(String kind) => _run(() async {
@@ -1059,9 +1251,13 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
             builder: (_) => MomentsScreen(
               api: _api!,
               since: pair['createdAt'] as int?,
+              myId: _myId,
               myName: (_state!['user'] as Map)['name']?.toString() ?? '',
               partnerName: (pair['partner'] as Map)['name']?.toString() ?? '',
               preview: _preview ? _previewMedia : null,
+              previewKept: _preview
+                  ? _messages.where((m) => m['kept'] == true).toList()
+                  : null,
             ),
           ),
         )
@@ -1660,8 +1856,6 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
                     partner['name'] as String,
                   ),
           ),
-          if (_uploadProgress != null)
-            LinearProgressIndicator(value: _uploadProgress, minHeight: 2),
           AnimatedSize(
             duration: const Duration(milliseconds: 220),
             curve: Curves.easeOutCubic,
@@ -1802,70 +1996,349 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
       (b['createdAt'] as int) - (a['createdAt'] as int) < 3 * 60 * 1000;
 
   void _startReply(Map<String, dynamic> message) {
+    if (_editing != null) _cancelEdit();
     setState(() => _replyTo = message);
     _messageFocus.requestFocus();
+  }
+
+  void _replaceMessage(Map<String, dynamic> updated) {
+    final index = _messages.indexWhere((m) => m['id'] == updated['id']);
+    if (index >= 0 && mounted) setState(() => _messages[index] = updated);
+  }
+
+  String get _myId => (_state!['user'] as Map)['id'] as String;
+
+  /// Applies the change on screen at once; the server's copy replaces it, or
+  /// the original comes back if the request fails.
+  Future<void> _optimistic(
+    Map<String, dynamic> original,
+    Map<String, dynamic> local,
+    Future<Map<String, dynamic>> Function() request,
+  ) async {
+    _replaceMessage(local);
+    if (_preview) return;
+    try {
+      _replaceMessage(await request());
+    } catch (error) {
+      _replaceMessage(original);
+      _showError(error);
+    }
+  }
+
+  Future<void> _react(Map<String, dynamic> message, String emoji) {
+    final reactions = ((message['reactions'] as List?) ?? const [])
+        .cast<Map<String, dynamic>>();
+    final current = reactions
+        .where((r) => r['userId'] == _myId)
+        .firstOrNull?['emoji'];
+    final next = current == emoji ? null : emoji;
+    HapticFeedback.selectionClick();
+    return _optimistic(message, {
+      ...message,
+      'reactions': [
+        ...reactions.where((r) => r['userId'] != _myId),
+        if (next != null) {'userId': _myId, 'emoji': next},
+      ],
+    }, () => _api!.react(message['id'] as int, next));
+  }
+
+  Future<void> _toggleKeep(Map<String, dynamic> message) {
+    final keep = message['kept'] != true;
+    _messengerKey.currentState?.showSnackBar(
+      SnackBar(
+        content: Text(keep ? 'Kept in Moments' : 'Removed from Moments'),
+      ),
+    );
+    return _optimistic(message, {
+      ...message,
+      'kept': keep,
+      'keptBy': keep ? _myId : null,
+    }, () => _api!.keep(message['id'] as int, keep));
+  }
+
+  void _startEdit(Map<String, dynamic> message) {
+    setState(() {
+      if (_editing == null) _draftBeforeEdit = _messageController.text;
+      _replyTo = null;
+      _editing = message;
+    });
+    final text = message['text'] as String;
+    _messageController.value = TextEditingValue(
+      text: text,
+      selection: TextSelection.collapsed(offset: text.length),
+    );
+    _messageFocus.requestFocus();
+  }
+
+  void _cancelEdit() {
+    setState(() => _editing = null);
+    _messageController.text = _draftBeforeEdit;
+    _draftBeforeEdit = '';
+  }
+
+  Future<void> _saveEdit() => _run(() async {
+    final editing = _editing!;
+    final text = _messageController.text.trim();
+    if (text.isEmpty) return;
+    if (text != editing['text']) {
+      _replaceMessage(
+        _preview
+            ? {
+                ...editing,
+                'text': text,
+                'editedAt': DateTime.now().millisecondsSinceEpoch,
+              }
+            : await _api!.editMessage(editing['id'] as int, text),
+      );
+    }
+    if (mounted && identical(_editing, editing)) _cancelEdit();
+  });
+
+  Future<void> _deleteMessage(Map<String, dynamic> message) async {
+    final media = message['kind'] != 'text';
+    final confirmed = await showDialog<bool>(
+      context: _navigatorKey.currentContext!,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete for both of you?'),
+        content: Text(
+          media
+              ? 'The ${message['kind'] == 'image' ? 'photo' : 'video'} is removed from both phones and your server. This can’t be undone.'
+              : 'The message is removed from both phones. This can’t be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Keep it'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: FilledButton.styleFrom(
+              backgroundColor: context.aida.danger,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    if (identical(_replyTo, message)) setState(() => _replyTo = null);
+    if (_editing?['id'] == message['id']) _cancelEdit();
+    await _run(() async {
+      _replaceMessage(
+        _preview
+            ? {
+                ...message,
+                'deleted': true,
+                'text': null,
+                'mediaId': null,
+                'reactions': const [],
+                'kept': false,
+              }
+            : await _api!.deleteMessage(message['id'] as int),
+      );
+    });
+  }
+
+  /// Downloads a photo or video into a private cache folder that is emptied
+  /// each time, so shared or saved copies don't pile up inside Aida.
+  Future<(File, String)> _downloadMedia(Map<String, dynamic> message) async {
+    final dir = Directory('${(await getTemporaryDirectory()).path}/outgoing');
+    if (await dir.exists()) await dir.delete(recursive: true);
+    await dir.create(recursive: true);
+    final mediaId = message['mediaId'] as String;
+    final partial = File('${dir.path}/$mediaId');
+    final type = await _api!.download(mediaId, partial);
+    final extension = switch (type.split(';').first.trim()) {
+      'image/jpeg' => 'jpg',
+      'image/png' => 'png',
+      'image/webp' => 'webp',
+      'image/gif' => 'gif',
+      'video/webm' => 'webm',
+      'video/quicktime' => 'mov',
+      _ when type.startsWith('video/') => 'mp4',
+      _ => 'jpg',
+    };
+    final file = await partial.rename('${dir.path}/aida-$mediaId.$extension');
+    return (file, type);
+  }
+
+  Future<void> _saveToPhone(Map<String, dynamic> message) => _run(() async {
+    if (!await Gal.hasAccess(toAlbum: true) &&
+        !await Gal.requestAccess(toAlbum: true)) {
+      throw const FormatException(
+        'Allow Aida to save photos in Android settings.',
+      );
+    }
+    _messengerKey.currentState?.showSnackBar(
+      const SnackBar(content: Text('Saving…')),
+    );
+    final (file, type) = await _downloadMedia(message);
+    try {
+      if (type.startsWith('video/')) {
+        await Gal.putVideo(file.path, album: 'Aida');
+      } else {
+        await Gal.putImage(file.path, album: 'Aida');
+      }
+    } on GalException catch (error) {
+      throw FormatException(switch (error.type) {
+        GalExceptionType.accessDenied =>
+          'Allow Aida to save photos in Android settings.',
+        GalExceptionType.notEnoughSpace => 'Your phone is out of space.',
+        GalExceptionType.notSupportedFormat =>
+          'Your phone can’t save this format.',
+        _ => 'Couldn’t save to your gallery.',
+      });
+    } finally {
+      await file.delete().catchError((_) => file);
+    }
+    _messengerKey.currentState
+      ?..hideCurrentSnackBar()
+      ..showSnackBar(const SnackBar(content: Text('Saved to your gallery')));
+  });
+
+  Future<void> _share(Map<String, dynamic> message) async {
+    if (message['kind'] == 'text') {
+      await SharePlus.instance.share(
+        ShareParams(text: message['text'] as String),
+      );
+      return;
+    }
+    await _run(() async {
+      final (file, type) = await _downloadMedia(message);
+      await SharePlus.instance.share(
+        ShareParams(files: [XFile(file.path, mimeType: type)]),
+      );
+    });
   }
 
   Future<void> _messageOptions(
     Map<String, dynamic> message,
     String author,
+    bool mine,
   ) async {
     HapticFeedback.mediumImpact();
     final kind = message['kind'];
     final sent = _sentAt(message);
     final time =
         '${sent.hour.toString().padLeft(2, '0')}:${sent.minute.toString().padLeft(2, '0')}';
+    final myReaction = ((message['reactions'] as List?) ?? const [])
+        .cast<Map<String, dynamic>>()
+        .where((r) => r['userId'] == _myId)
+        .firstOrNull?['emoji'];
     final choice = await showModalBottomSheet<String>(
       context: _navigatorKey.currentContext!,
-      showDragHandle: true,
+      isScrollControlled: true,
       builder: (context) {
         final c = context.aida;
-        Widget option(IconData icon, String label, String value) => ListTile(
-          leading: Icon(icon, color: c.accent),
-          title: Text(label, style: TextStyle(color: c.ink, fontSize: 15.5)),
+        Widget option(
+          IconData icon,
+          String label,
+          String value, {
+          Color? color,
+        }) => ListTile(
+          leading: Icon(icon, color: color ?? c.accent),
+          title: Text(
+            label,
+            style: TextStyle(color: color ?? c.ink, fontSize: 15.5),
+          ),
+          visualDensity: VisualDensity.compact,
           onTap: () => Navigator.pop(context, value),
         );
         return SafeArea(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(24, 0, 24, 10),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      '$author · $time',
-                      style: TextStyle(color: c.muted, fontSize: 12.5),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      messageSnippet(message),
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(color: c.ink, fontSize: 15),
-                    ),
-                  ],
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      for (final emoji in reactionChoices)
+                        _ReactionChoice(
+                          emoji: emoji,
+                          selected: emoji == myReaction,
+                          onTap: () => Navigator.pop(context, 'react:$emoji'),
+                        ),
+                    ],
+                  ),
                 ),
-              ),
-              const Divider(height: 1),
-              const SizedBox(height: 6),
-              option(Icons.reply_rounded, 'Reply', 'reply'),
-              if (kind == 'text')
-                option(Icons.copy_rounded, 'Copy text', 'copy'),
-              if (kind == 'image')
-                option(Icons.open_in_full_rounded, 'View photo', 'view'),
-              if (kind == 'video')
-                option(Icons.play_circle_outline_rounded, 'Play video', 'view'),
-              const SizedBox(height: 8),
-            ],
+                Container(
+                  margin: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+                  width: double.infinity,
+                  decoration: BoxDecoration(
+                    color: c.surfaceMuted,
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '$author · $time',
+                        style: TextStyle(color: c.muted, fontSize: 12.5),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        messageSnippet(message),
+                        maxLines: 3,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(color: c.ink, fontSize: 15),
+                      ),
+                    ],
+                  ),
+                ),
+                option(Icons.reply_rounded, 'Reply', 'reply'),
+                if (kind == 'text')
+                  option(Icons.copy_rounded, 'Copy text', 'copy'),
+                if (kind == 'image')
+                  option(Icons.open_in_full_rounded, 'View photo', 'view'),
+                if (kind == 'video')
+                  option(
+                    Icons.play_circle_outline_rounded,
+                    'Play video',
+                    'view',
+                  ),
+                option(
+                  message['kept'] == true
+                      ? Icons.bookmark_remove_outlined
+                      : Icons.bookmark_add_outlined,
+                  message['kept'] == true
+                      ? 'Remove from Moments'
+                      : 'Keep in Moments',
+                  'keep',
+                ),
+                if (kind != 'text')
+                  option(Icons.download_rounded, 'Save to your phone', 'save'),
+                option(Icons.ios_share_rounded, 'Share', 'share'),
+                if (mine && kind == 'text')
+                  option(Icons.edit_outlined, 'Edit', 'edit'),
+                if (mine) ...[
+                  const Divider(indent: 16, endIndent: 16),
+                  option(
+                    Icons.delete_outline_rounded,
+                    'Delete for both of you',
+                    'delete',
+                    color: c.danger,
+                  ),
+                ],
+                const SizedBox(height: 8),
+              ],
+            ),
           ),
         );
       },
     );
     final navigator = _navigatorKey.currentContext;
-    if (!mounted || navigator == null || !navigator.mounted) return;
+    if (!mounted || navigator == null || !navigator.mounted || choice == null) {
+      return;
+    }
+    if (choice.startsWith('react:')) {
+      await _react(message, choice.substring(6));
+      return;
+    }
     switch (choice) {
       case 'reply':
         _startReply(message);
@@ -1878,6 +2351,16 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
         openPhoto(navigator, _api!, message['mediaId'] as String);
       case 'view':
         openVideo(navigator, _api!, message['mediaId'] as String);
+      case 'keep':
+        await _toggleKeep(message);
+      case 'save':
+        await _saveToPhone(message);
+      case 'share':
+        await _share(message);
+      case 'edit':
+        _startEdit(message);
+      case 'delete':
+        await _deleteMessage(message);
     }
   }
 
@@ -1914,9 +2397,15 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
     });
   }
 
-  Widget _replyBar(AidaColors c, String myId, String partnerName) {
-    final reply = _replyTo!;
-    final icon = snippetIcon(reply);
+  Widget _composerBar(
+    AidaColors c, {
+    required IconData icon,
+    required String title,
+    required Map<String, dynamic> message,
+    required String closeTooltip,
+    required VoidCallback onClose,
+  }) {
+    final kindIcon = snippetIcon(message);
     return Container(
       margin: const EdgeInsets.fromLTRB(12, 4, 12, 2),
       padding: const EdgeInsets.fromLTRB(14, 8, 4, 8),
@@ -1927,7 +2416,7 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
       ),
       child: Row(
         children: [
-          Icon(Icons.reply_rounded, size: 20, color: c.accent),
+          Icon(icon, size: 20, color: c.accent),
           const SizedBox(width: 10),
           Expanded(
             child: Column(
@@ -1935,9 +2424,7 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
-                  reply['senderId'] == myId
-                      ? 'Replying to yourself'
-                      : 'Replying to $partnerName',
+                  title,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
@@ -1949,13 +2436,13 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
                 const SizedBox(height: 1),
                 Row(
                   children: [
-                    if (icon != null) ...[
-                      Icon(icon, size: 14, color: c.muted),
+                    if (kindIcon != null) ...[
+                      Icon(kindIcon, size: 14, color: c.muted),
                       const SizedBox(width: 4),
                     ],
                     Expanded(
                       child: Text(
-                        messageSnippet(reply),
+                        messageSnippet(message),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(color: c.muted, fontSize: 13),
@@ -1967,8 +2454,8 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
             ),
           ),
           IconButton(
-            tooltip: 'Cancel reply',
-            onPressed: () => setState(() => _replyTo = null),
+            tooltip: closeTooltip,
+            onPressed: onClose,
             icon: Icon(Icons.close_rounded, size: 20, color: c.muted),
           ),
         ],
@@ -2015,7 +2502,7 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
                 quoteAuthor: quoted?['senderId'] == myId ? 'You' : partnerName,
                 onReply: () => _startReply(message),
                 onOptions: () =>
-                    _messageOptions(message, mine ? 'You' : partnerName),
+                    _messageOptions(message, mine ? 'You' : partnerName, mine),
                 onQuoteTap: quotedId == null ? null : () => _jumpTo(quotedId),
                 receipt: id <= _partnerRead
                     ? 'Read'
@@ -2086,56 +2573,98 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
         AnimatedSize(
           duration: const Duration(milliseconds: 200),
           curve: Curves.easeOutCubic,
-          child: _replyTo == null
-              ? const SizedBox(width: double.infinity)
-              : _replyBar(c, myId, partnerName),
+          child: _editing != null
+              ? _composerBar(
+                  c,
+                  icon: Icons.edit_outlined,
+                  title: 'Editing message',
+                  message: _editing!,
+                  closeTooltip: 'Cancel edit',
+                  onClose: _cancelEdit,
+                )
+              : _replyTo != null
+              ? _composerBar(
+                  c,
+                  icon: Icons.reply_rounded,
+                  title: _replyTo!['senderId'] == myId
+                      ? 'Replying to yourself'
+                      : 'Replying to $partnerName',
+                  message: _replyTo!,
+                  closeTooltip: 'Cancel reply',
+                  onClose: () => setState(() => _replyTo = null),
+                )
+              : const SizedBox(width: double.infinity),
         ),
+        if (_uploadLabel != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 6, 20, 0),
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    value: _uploadProgress,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Text(
+                  _uploadLabel!,
+                  style: TextStyle(color: c.muted, fontSize: 12.5),
+                ),
+              ],
+            ),
+          ),
         Padding(
           padding: const EdgeInsets.fromLTRB(6, 4, 12, 10),
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
-              PopupMenuButton<String>(
-                enabled: !_busy,
-                tooltip: 'Attach photo or video',
-                position: PopupMenuPosition.over,
-                onSelected: (value) => _pickAndUpload(value == 'video'),
-                itemBuilder: (_) => [
-                  PopupMenuItem(
-                    value: 'image',
-                    child: _menuRow(c, Icons.photo_outlined, 'Photo'),
-                  ),
-                  PopupMenuItem(
-                    value: 'video',
-                    child: _menuRow(c, Icons.videocam_outlined, 'Video'),
-                  ),
-                ],
+              IconButton(
+                tooltip: 'Attach',
+                onPressed: _busy || _editing != null
+                    ? null
+                    : () => _attach(partnerName, topicName),
                 icon: Icon(
                   Icons.add_circle_outline_rounded,
-                  color: c.accent,
+                  color: _editing != null ? c.border : c.accent,
                   size: 26,
                 ),
               ),
               Expanded(
-                child: TextField(
-                  controller: _messageController,
-                  focusNode: _messageFocus,
-                  onChanged: _typingChanged,
-                  maxLines: 5,
-                  minLines: 1,
-                  maxLength: 5000,
-                  textCapitalization: TextCapitalization.sentences,
-                  textInputAction: TextInputAction.newline,
-                  style: TextStyle(color: c.ink, fontSize: 15.5, height: 1.4),
-                  decoration: InputDecoration(
-                    hintText: _topicId == 'general'
-                        ? 'A little message…'
-                        : 'Message in $topicName…',
-                    counterText: '',
-                    isDense: true,
-                    contentPadding: const EdgeInsets.symmetric(
-                      horizontal: 18,
-                      vertical: 13,
+                child: ValueListenableBuilder<TextEditingValue>(
+                  valueListenable: _messageController,
+                  builder: (context, value, _) => TextField(
+                    controller: _messageController,
+                    focusNode: _messageFocus,
+                    onChanged: _typingChanged,
+                    maxLines: 5,
+                    minLines: 1,
+                    maxLength: 5000,
+                    textCapitalization: TextCapitalization.sentences,
+                    textInputAction: TextInputAction.newline,
+                    style: TextStyle(color: c.ink, fontSize: 15.5, height: 1.4),
+                    decoration: InputDecoration(
+                      hintText: _topicId == 'general'
+                          ? 'A little message…'
+                          : 'Message in $topicName…',
+                      counterText: '',
+                      isDense: true,
+                      contentPadding: const EdgeInsets.fromLTRB(18, 13, 6, 13),
+                      suffixIconConstraints: const BoxConstraints(
+                        minWidth: 44,
+                        minHeight: 44,
+                      ),
+                      // The camera sits in the field until you start typing.
+                      suffixIcon: value.text.isEmpty && _editing == null
+                          ? _CameraButton(
+                              color: c.muted,
+                              enabled: !_busy,
+                              onPhoto: () => _capture(video: false),
+                              onVideo: () => _capture(video: true),
+                            )
+                          : null,
                     ),
                   ),
                 ),
@@ -2145,13 +2674,18 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
                 valueListenable: _messageController,
                 builder: (context, value, _) {
                   final ready = value.text.trim().isNotEmpty;
+                  final editing = _editing != null;
                   return AnimatedScale(
                     scale: ready ? 1 : .9,
                     duration: const Duration(milliseconds: 200),
                     curve: Curves.easeOutBack,
                     child: IconButton.filled(
-                      tooltip: 'Send',
-                      onPressed: _busy ? null : _sendText,
+                      tooltip: editing ? 'Save edit' : 'Send',
+                      onPressed: _busy
+                          ? null
+                          : editing
+                          ? _saveEdit
+                          : _sendText,
                       style: IconButton.styleFrom(
                         fixedSize: const Size(46, 46),
                         backgroundColor: ready ? c.accent : c.accentSoft,
@@ -2167,7 +2701,12 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
                                 color: c.accent,
                               ),
                             )
-                          : const Icon(Icons.arrow_upward_rounded, size: 22),
+                          : Icon(
+                              editing
+                                  ? Icons.check_rounded
+                                  : Icons.arrow_upward_rounded,
+                              size: 22,
+                            ),
                     ),
                   );
                 },
@@ -2243,4 +2782,142 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
       ),
     );
   }
+}
+
+class _ReactionChoice extends StatelessWidget {
+  const _ReactionChoice({
+    required this.emoji,
+    required this.selected,
+    required this.onTap,
+  });
+  final String emoji;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.aida;
+    return Semantics(
+      button: true,
+      selected: selected,
+      label: 'React $emoji',
+      excludeSemantics: true,
+      child: InkResponse(
+        onTap: onTap,
+        radius: 28,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          width: 48,
+          height: 48,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: selected ? c.accentSoft : c.surfaceMuted,
+            shape: BoxShape.circle,
+            border: Border.all(
+              color: selected ? c.accent : Colors.transparent,
+              width: 1.5,
+            ),
+          ),
+          child: Text(emoji, style: const TextStyle(fontSize: 24)),
+        ),
+      ),
+    );
+  }
+}
+
+class _AttachTile extends StatelessWidget {
+  const _AttachTile({
+    required this.icon,
+    required this.label,
+    required this.caption,
+    required this.tint,
+    required this.onTap,
+  });
+  final IconData icon;
+  final String label;
+  final String caption;
+  final Color tint;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.aida;
+    return Material(
+      color: c.background,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(22),
+        side: BorderSide(color: c.border),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(10, 18, 10, 16),
+          child: Column(
+            children: [
+              Container(
+                width: 52,
+                height: 52,
+                decoration: BoxDecoration(
+                  color: tint.withValues(alpha: .14),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(icon, color: tint, size: 26),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                label,
+                style: TextStyle(
+                  color: c.ink,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                caption,
+                textAlign: TextAlign.center,
+                maxLines: 2,
+                style: TextStyle(color: c.muted, fontSize: 11.5, height: 1.3),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Tap for a photo, press and hold for a video.
+class _CameraButton extends StatelessWidget {
+  const _CameraButton({
+    required this.color,
+    required this.enabled,
+    required this.onPhoto,
+    required this.onVideo,
+  });
+  final Color color;
+  final bool enabled;
+  final VoidCallback onPhoto;
+  final VoidCallback onVideo;
+
+  @override
+  Widget build(BuildContext context) => Semantics(
+    button: true,
+    enabled: enabled,
+    label: 'Take a photo',
+    hint: 'Press and hold to record a video',
+    excludeSemantics: true,
+    child: InkResponse(
+      onTap: enabled ? onPhoto : null,
+      onLongPress: enabled
+          ? () {
+              HapticFeedback.mediumImpact();
+              onVideo();
+            }
+          : null,
+      radius: 22,
+      child: Icon(Icons.photo_camera_outlined, color: color, size: 22),
+    ),
+  );
 }

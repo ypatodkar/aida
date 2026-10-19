@@ -175,6 +175,47 @@ class AidaApi {
     return value;
   }
 
+  /// Messages in [topicId] that changed (edits, deletions, reactions, keeps)
+  /// after change number [since].
+  Future<Map<String, dynamic>> changes({
+    required int since,
+    required String topicId,
+  }) => _request(
+    'GET',
+    '/v1/messages/changes?since=$since&topicId=${Uri.encodeComponent(topicId)}',
+  );
+
+  Future<Map<String, dynamic>> editMessage(int id, String text) =>
+      _request('PATCH', '/v1/messages/$id', body: {'text': text});
+
+  Future<Map<String, dynamic>> deleteMessage(int id) =>
+      _request('DELETE', '/v1/messages/$id');
+
+  /// Sets this person's reaction, or clears it when [emoji] is null.
+  Future<Map<String, dynamic>> react(int id, String? emoji) => emoji == null
+      ? _request('DELETE', '/v1/messages/$id/reaction')
+      : _request('PUT', '/v1/messages/$id/reaction', body: {'emoji': emoji});
+
+  Future<Map<String, dynamic>> keep(int id, bool keep) =>
+      _request(keep ? 'PUT' : 'DELETE', '/v1/messages/$id/keep');
+
+  Future<Map<String, dynamic>> kept() => _request('GET', '/v1/kept');
+
+  /// Saves a photo or video to [file] and returns its content type.
+  Future<String> download(String mediaId, File file) async {
+    final request = http.Request('GET', mediaUrl(mediaId))
+      ..headers.addAll(mediaHeaders);
+    final response = await _client.send(request);
+    if (response.statusCode != 200) {
+      throw ApiException(
+        'That photo or video is unavailable',
+        response.statusCode,
+      );
+    }
+    await response.stream.pipe(file.openWrite());
+    return response.headers['content-type'] ?? 'application/octet-stream';
+  }
+
   Uri mediaUrl(String id) => _uri('/v1/media/$id');
 
   Map<String, String> get mediaHeaders => {'authorization': 'Bearer $token'};

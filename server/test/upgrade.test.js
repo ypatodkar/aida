@@ -11,7 +11,11 @@ test('v1 database upgrades twice without losing users, pairing, sessions, or mes
   let db;
   try {
     db = openDatabase(path);
-    db.exec(`DROP INDEX messages_by_topic; ALTER TABLE messages DROP COLUMN topic_id;
+    // Strip everything added after v1 so the file matches a real v1 database.
+    db.exec(`DROP INDEX messages_by_change; DROP TABLE reactions; DROP TABLE kept;
+      ALTER TABLE messages DROP COLUMN reply_to_id; ALTER TABLE messages DROP COLUMN updated_seq;
+      ALTER TABLE messages DROP COLUMN edited_at; ALTER TABLE messages DROP COLUMN deleted_at;
+      DROP INDEX messages_by_topic; ALTER TABLE messages DROP COLUMN topic_id;
       DROP TABLE receipts; ALTER TABLE users DROP COLUMN last_seen_at; DROP TABLE topics; DROP TABLE push_outbox; DROP TABLE devices;
       INSERT INTO users (id,email,name,pair_id,created_at) VALUES ('a','a@test.com','A','pair',1),('b','b@test.com','B','pair',1);
       INSERT INTO pairs (id,a_id,b_id,state,created_at) VALUES ('pair','a','b','active',1);
@@ -27,6 +31,12 @@ test('v1 database upgrades twice without losing users, pairing, sessions, or mes
       assert.equal(message.id, 1);
       assert.equal(message.text, 'Keep this message');
       assert.equal(message.topic_id, 'general');
+      assert.equal(message.reply_to_id, null);
+      assert.equal(message.updated_seq, 0);
+      assert.equal(message.edited_at, null);
+      assert.equal(message.deleted_at, null);
+      assert.equal(db.prepare('SELECT COUNT(*) AS n FROM reactions').get().n, 0);
+      assert.equal(db.prepare('SELECT COUNT(*) AS n FROM kept').get().n, 0);
       assert.equal(db.prepare('SELECT last_seen_at FROM users LIMIT 1').get().last_seen_at, null);
       assert.equal(db.prepare('SELECT COUNT(*) AS n FROM receipts').get().n, 0);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);

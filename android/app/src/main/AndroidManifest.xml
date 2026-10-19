@@ -11,9 +11,13 @@
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- Saving photos and videos to the gallery; only needed up to Android 10. -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <application
         android:allowBackup="false"
+        android:requestLegacyExternalStorage="true"
         android:label="Aida"
         android:name="${applicationName}"
         android:icon="@drawable/aida_launcher">

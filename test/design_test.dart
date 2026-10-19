@@ -173,4 +173,152 @@ void main() {
     expect(highlighted(), isFalse);
     expect(tester.takeException(), isNull);
   }, skip: _skip);
+
+  /// The bubble's own text, not a quote of it inside a reply.
+  Finder bubbleText(String text) => find.descendant(
+    of: find.byWidgetPredicate(
+      (w) => w is MessageTile && w.message['text'] == text,
+    ),
+    matching: find.text(text),
+  );
+
+  Future<void> holdMessage(WidgetTester tester, String text) async {
+    await tester.longPress(bubbleText(text));
+    await tester.pumpAndSettle();
+  }
+
+  testWidgets('reactions show under the bubble and can be added', (
+    tester,
+  ) async {
+    await _phone(tester);
+    await tester.pumpAndSettle();
+    expect(find.bySemanticsLabel('Reactions: ❤️'), findsOneWidget);
+    expect(find.textContaining('edited ·'), findsOneWidget);
+
+    await holdMessage(tester, 'Just because you’re there.');
+    await tester.tap(find.bySemanticsLabel('React 😂'));
+    await tester.pumpAndSettle();
+    expect(find.bySemanticsLabel('Reactions: ❤️ 😂'), findsOneWidget);
+
+    // Choosing the same reaction again takes it back.
+    await holdMessage(tester, 'Just because you’re there.');
+    await tester.tap(find.bySemanticsLabel('React 😂'));
+    await tester.pumpAndSettle();
+    expect(find.bySemanticsLabel('Reactions: ❤️'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  }, skip: _skip);
+
+  testWidgets('only your own messages can be edited or deleted', (
+    tester,
+  ) async {
+    await _phone(tester);
+    await tester.pumpAndSettle();
+    await holdMessage(tester, 'Found the little café I told you about ☕');
+    expect(find.text('Keep in Moments'), findsOneWidget);
+    expect(find.text('Share'), findsOneWidget);
+    expect(find.text('Edit'), findsNothing);
+    expect(find.text('Delete for both of you'), findsNothing);
+    await tester.tapAt(const Offset(20, 20));
+    await tester.pumpAndSettle();
+
+    await holdMessage(tester, 'Already my favorite place.');
+    expect(find.text('Edit'), findsOneWidget);
+    expect(find.text('Delete for both of you'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  }, skip: _skip);
+
+  testWidgets('editing a message updates it and marks it edited', (
+    tester,
+  ) async {
+    await _phone(tester);
+    await tester.pumpAndSettle();
+    await holdMessage(tester, 'Already my favorite place.');
+    await tester.tap(find.text('Edit'));
+    await tester.pumpAndSettle();
+    expect(find.text('Editing message'), findsOneWidget);
+    expect(find.bySemanticsLabel('Take a photo'), findsNothing);
+
+    await tester.enterText(
+      find.byType(TextField),
+      'Already our favorite place.',
+    );
+    await tester.tap(find.byTooltip('Save edit'));
+    await tester.pumpAndSettle();
+    expect(find.text('Editing message'), findsNothing);
+    expect(bubbleText('Already our favorite place.'), findsOneWidget);
+    expect(find.textContaining('edited ·'), findsNWidgets(2));
+    // The draft that was set aside comes back empty, with the camera.
+    expect(find.bySemanticsLabel('Take a photo'), findsOneWidget);
+  }, skip: _skip);
+
+  testWidgets('deleting asks first, then leaves a placeholder', (tester) async {
+    await _phone(tester);
+    await tester.pumpAndSettle();
+    await holdMessage(tester, 'Already my favorite place.');
+    await tester.tap(find.text('Delete for both of you'));
+    await tester.pumpAndSettle();
+    expect(find.text('Delete for both of you?'), findsOneWidget);
+    await tester.tap(find.text('Keep it'));
+    await tester.pumpAndSettle();
+    expect(find.text('You deleted this message'), findsNothing);
+
+    await holdMessage(tester, 'Already my favorite place.');
+    await tester.tap(find.text('Delete for both of you'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(FilledButton, 'Delete'));
+    await tester.pumpAndSettle();
+    expect(find.text('You deleted this message'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  }, skip: _skip);
+
+  testWidgets('kept messages appear in Moments', (tester) async {
+    await _phone(tester, size: const Size(390, 900));
+    await tester.pumpAndSettle();
+    await holdMessage(tester, 'Found the little café I told you about ☕');
+    await tester.tap(find.text('Keep in Moments'));
+    await tester.pumpAndSettle();
+    expect(find.text('Kept in Moments'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('Moments and Us'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Moments'));
+    for (var i = 0; i < 12; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+    expect(find.text('KEPT'), findsOneWidget);
+    expect(
+      find.text('“Found the little café I told you about ☕”'),
+      findsOneWidget,
+    );
+    expect(
+      find.text('“Saving you a seat for when you get here.”'),
+      findsOneWidget,
+    );
+    await tester.tap(find.byTooltip('Remove from Moments').first);
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.byTooltip('Remove from Moments'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  }, skip: _skip);
+
+  testWidgets('the attach sheet offers camera, video, and gallery', (
+    tester,
+  ) async {
+    await _phone(tester, size: const Size(360, 740));
+    await tester.pumpAndSettle();
+    expect(find.bySemanticsLabel('Take a photo'), findsOneWidget);
+    await tester.tap(find.byTooltip('Attach'));
+    await tester.pumpAndSettle();
+    expect(find.text('Share with Sofia'), findsOneWidget);
+    expect(find.text('In Everyday'), findsOneWidget);
+    for (final label in ['Camera', 'Video', 'Gallery']) {
+      expect(find.text(label), findsOneWidget);
+    }
+    expect(tester.takeException(), isNull);
+
+    await tester.tapAt(const Offset(20, 20));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), 'Hello');
+    await tester.pump();
+    expect(find.bySemanticsLabel('Take a photo'), findsNothing);
+  }, skip: _skip);
 }

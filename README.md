@@ -9,7 +9,14 @@ Aida lets each account have **one active partner**. Either person can disconnect
 - Backend integration tests for authentication, pairing races, media authorization/deletion, WebSocket delivery, and calls against local LiveKit.
 - AWS deployment: Node API, Caddy HTTPS, and self-hosted LiveKit on one Lightsail instance, with persistent chat storage and automatic certificate renewal.
 
-## Version 2.1 (current: 2.1.0, Android version code 4)
+## Version 2.2 (current: 2.2.0, Android version code 5)
+
+- Press and hold a message for quick reactions (❤️ 😂 😮 😢 👍 🔥), Reply, Copy, Keep in Moments, Save to your phone (photos and videos go to an "Aida" album), Share, and, for your own messages, Edit and Delete for both of you. Reactions notify the author; pushes still carry no message text.
+- Deleting removes the text or media file from the server and both phones and leaves a "deleted" placeholder. Edits are marked "edited". Kept messages appear in a Kept section in Moments.
+- Camera: the camera button in the message field takes a photo with the phone's camera app (hold it to record a video). The "+" sheet offers Camera, Video, and Gallery; Gallery sends up to 10 photos and videos at once. Photos are resized to at most 2560 px before upload.
+- Sync: the server numbers every change to an existing message (`updated_seq`), and `GET /v1/messages/changes` lets the app catch up on edits, deletions, reactions, and keeps. Additive migration; disconnect also erases reactions and keeps.
+
+## Version 2.1 (2.1.0, Android version code 4)
 
 - Redesign: the conversation is the home screen, with Moments (days together, next milestone, and every shared photo/video across topics) and Us (partner, theme, accent colour, privacy, account controls) behind the header menu. Warm off-white and muted lavender, Instrument Serif headings, dark mode, and four accent choices (saved per device).
 - Replies: swipe a message right, or press and hold for Reply / Copy text / View photo. Replies quote the original; tap the quote to jump to it. The server stores `reply_to_id` (additive migration) and only accepts replies within the same connection and topic. 2.0.1 clients ignore the quote.
@@ -37,9 +44,9 @@ Aida lets each account have **one active partner**. Either person can disconnect
 
 ### Install as an update
 
-Current signed APK: `build/releases/aida-v2.1.0.apk` (SHA-256 alongside it).
+Current signed APK: `build/releases/aida-v2.2.0.apk` (SHA-256 alongside it), also attached to the GitHub release `v2.2.0`.
 
-The package remains `com.yashpatodkar.aida`, and the APK uses the same release signing key as version 1. Its version code is now 4, greater than all previous builds (1–3). **Install the new APK over the old app; do not uninstall, clear storage, or tap Disconnect.** Android preserves the existing secure-storage session and settings, and AWS preserves your pairing and conversation. An expired sign-in session can require signing in again with the same Google account; this does not end the server-side connection.
+The package remains `com.yashpatodkar.aida`, and the APK uses the same release signing key as version 1. Its version code is now 5, greater than all previous builds (1–4). **Install the new APK over the old app; do not uninstall, clear storage, or tap Disconnect.** Android preserves the existing secure-storage session and settings, and AWS preserves your pairing and conversation. An expired sign-in session can require signing in again with the same Google account; this does not end the server-side connection.
 
 ### Enable background notifications
 

@@ -4,27 +4,32 @@ import 'api.dart';
 import 'design.dart';
 import 'media_view.dart';
 
-/// The couple's shared space: how long they've been together, and every photo
-/// and video either of them has shared, across all topics, newest first.
+/// The couple's shared space: how long they've been together, the messages
+/// they chose to keep, and every photo and video either of them has shared,
+/// across all topics, newest first.
 class MomentsScreen extends StatefulWidget {
   const MomentsScreen({
     super.key,
     required this.api,
     required this.since,
+    required this.myId,
     required this.myName,
     required this.partnerName,
     this.preview,
+    this.previewKept,
   });
 
   final AidaApi api;
 
   /// Pair creation time in epoch milliseconds, if the server provides it.
   final int? since;
+  final String myId;
   final String myName;
   final String partnerName;
 
   /// Design-preview media; when set, no network requests are made.
   final List<Map<String, dynamic>>? preview;
+  final List<Map<String, dynamic>>? previewKept;
 
   @override
   State<MomentsScreen> createState() => _MomentsScreenState();
@@ -32,6 +37,7 @@ class MomentsScreen extends StatefulWidget {
 
 class _MomentsScreenState extends State<MomentsScreen> {
   final List<Map<String, dynamic>> _media = [];
+  List<Map<String, dynamic>> _kept = [];
   bool _loading = true;
   String? _problem;
 
@@ -40,9 +46,35 @@ class _MomentsScreenState extends State<MomentsScreen> {
     super.initState();
     if (widget.preview != null) {
       _media.addAll(widget.preview!.reversed);
+      _kept = [...?widget.previewKept];
       _loading = false;
     } else {
       _load();
+      _loadKept();
+    }
+  }
+
+  Future<void> _loadKept() async {
+    try {
+      final kept = (await widget.api.kept())['kept'] as List;
+      if (mounted) setState(() => _kept = kept.cast<Map<String, dynamic>>());
+    } catch (_) {
+      // The photo grid reports connection problems; kept messages just wait.
+    }
+  }
+
+  Future<void> _unkeep(Map<String, dynamic> message) async {
+    final before = _kept;
+    setState(() => _kept = [..._kept]..remove(message));
+    if (widget.preview != null) return;
+    try {
+      await widget.api.keep(message['id'] as int, false);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _kept = before);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Couldn’t remove it. Try again.')),
+      );
     }
   }
 
@@ -125,6 +157,41 @@ class _MomentsScreenState extends State<MomentsScreen> {
                 ),
               ),
             ),
+          if (_kept.isNotEmpty) ...[
+            SliverPadding(
+              padding: const EdgeInsets.fromLTRB(22, 24, 22, 12),
+              sliver: SliverToBoxAdapter(
+                child: Row(
+                  children: [
+                    const Eyebrow('Kept'),
+                    const Spacer(),
+                    Text(
+                      '${_kept.length}',
+                      style: TextStyle(color: c.muted, fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            SliverPadding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              sliver: SliverList.separated(
+                itemCount: _kept.length,
+                separatorBuilder: (_, _) => const SizedBox(height: 8),
+                itemBuilder: (context, index) {
+                  final item = _kept[index];
+                  return _KeptCard(
+                    api: widget.api,
+                    message: item,
+                    author: item['senderId'] == widget.myId
+                        ? widget.myName
+                        : widget.partnerName,
+                    onRemove: () => _unkeep(item),
+                  );
+                },
+              ),
+            ),
+          ],
           SliverPadding(
             padding: const EdgeInsets.fromLTRB(22, 24, 22, 12),
             sliver: SliverToBoxAdapter(
@@ -310,6 +377,122 @@ class _MomentTile extends StatelessWidget {
                     ),
                   ),
                 ),
+        ),
+      ),
+    );
+  }
+}
+
+/// A kept message: text set as a quote, or a photo or video thumbnail.
+class _KeptCard extends StatelessWidget {
+  const _KeptCard({
+    required this.api,
+    required this.message,
+    required this.author,
+    required this.onRemove,
+  });
+  final AidaApi api;
+  final Map<String, dynamic> message;
+  final String author;
+  final VoidCallback onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.aida;
+    final kind = message['kind'];
+    final mediaId = message['mediaId'] as String?;
+    final sent = DateTime.fromMillisecondsSinceEpoch(
+      message['createdAt'] as int,
+    );
+    final details =
+        '$author · ${longDate(sent)} · ${message['topicName'] ?? 'Everyday'}';
+    Widget body;
+    if (kind == 'text') {
+      body = Text(
+        '“${message['text']}”',
+        maxLines: 6,
+        overflow: TextOverflow.ellipsis,
+        style: TextStyle(
+          fontFamily: serif,
+          fontSize: 21,
+          height: 1.3,
+          color: c.ink,
+        ),
+      );
+    } else {
+      final video = kind == 'video';
+      body = Row(
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(12),
+            child: Container(
+              width: 64,
+              height: 64,
+              color: c.surfaceMuted,
+              child: video || mediaId == null
+                  ? Icon(Icons.play_circle_outline_rounded, color: c.accent)
+                  : Image.network(
+                      api.mediaUrl(mediaId).toString(),
+                      headers: api.mediaHeaders,
+                      fit: BoxFit.cover,
+                      cacheWidth: 200,
+                      errorBuilder: (_, _, _) => Icon(
+                        Icons.image_not_supported_outlined,
+                        color: c.muted,
+                      ),
+                    ),
+            ),
+          ),
+          const SizedBox(width: 14),
+          Text(
+            video ? 'Video' : 'Photo',
+            style: TextStyle(color: c.ink, fontSize: 15.5),
+          ),
+        ],
+      );
+    }
+    return Material(
+      color: c.surface,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(20),
+        side: BorderSide(color: c.border),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: mediaId == null
+            ? null
+            : () => kind == 'video'
+                  ? openVideo(context, api, mediaId)
+                  : openPhoto(context, api, mediaId),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(18, 16, 6, 6),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(padding: const EdgeInsets.only(right: 12), child: body),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      details,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(color: c.muted, fontSize: 12),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Remove from Moments',
+                    onPressed: onRemove,
+                    icon: Icon(
+                      Icons.bookmark_remove_outlined,
+                      size: 20,
+                      color: c.muted,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
         ),
       ),
     );

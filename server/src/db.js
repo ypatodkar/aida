@@ -124,6 +124,35 @@ export function openDatabase(path) {
   if (!messageColumns.some(column => column.name === 'reply_to_id')) {
     db.exec('ALTER TABLE messages ADD COLUMN reply_to_id INTEGER');
   }
+  // Additive migration: edits, deletions, reactions, and keeps change existing
+  // messages; updated_seq orders those changes so clients can catch up.
+  if (!messageColumns.some(column => column.name === 'updated_seq')) {
+    db.exec('ALTER TABLE messages ADD COLUMN updated_seq INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!messageColumns.some(column => column.name === 'edited_at')) {
+    db.exec('ALTER TABLE messages ADD COLUMN edited_at INTEGER');
+  }
+  if (!messageColumns.some(column => column.name === 'deleted_at')) {
+    db.exec('ALTER TABLE messages ADD COLUMN deleted_at INTEGER');
+  }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS messages_by_change ON messages(pair_id, topic_id, updated_seq);
+    CREATE TABLE IF NOT EXISTS reactions (
+      message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+      pair_id TEXT NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL REFERENCES users(id),
+      emoji TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (message_id, user_id)
+    );
+    CREATE TABLE IF NOT EXISTS kept (
+      message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+      pair_id TEXT NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL REFERENCES users(id),
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS kept_by_pair ON kept(pair_id, created_at);
+  `);
   return db;
 }
 

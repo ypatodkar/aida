@@ -24,6 +24,8 @@ class MessageTile extends StatelessWidget {
     this.onQuoteTap,
   });
 
+  static const _textPadding = EdgeInsets.fromLTRB(14, 9, 12, 8);
+
   final Map<String, dynamic> message;
   final bool mine;
   final AidaApi api;
@@ -48,14 +50,26 @@ class MessageTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = context.aida;
     final kind = message['kind'] as String;
+    final deleted = message['deleted'] == true;
     final mediaId = message['mediaId'] as String?;
-    final media = (kind == 'image' || kind == 'video') && mediaId != null;
-    final foreground = mine ? c.onMine : c.ink;
+    final media =
+        !deleted && (kind == 'image' || kind == 'video') && mediaId != null;
+    final kept = !deleted && message['kept'] == true;
+    final reactions = deleted
+        ? const <Map<String, dynamic>>[]
+        : ((message['reactions'] as List?) ?? const [])
+              .cast<Map<String, dynamic>>();
+    final reply = deleted ? null : onReply;
+    final options = deleted ? null : onOptions;
+    final foreground = deleted ? c.muted : (mine ? c.onMine : c.ink);
     final created = DateTime.fromMillisecondsSinceEpoch(
       message['createdAt'] as int,
     );
-    final time =
+    final clock =
         '${created.hour.toString().padLeft(2, '0')}:${created.minute.toString().padLeft(2, '0')}';
+    final time = !deleted && message['editedAt'] != null
+        ? 'edited · $clock'
+        : clock;
     final timeStyle = TextStyle(
       fontSize: 10,
       color: foreground.withValues(alpha: .62),
@@ -64,8 +78,17 @@ class MessageTile extends StatelessWidget {
     final meta = Row(
       mainAxisSize: MainAxisSize.min,
       children: [
+        if (kept) ...[
+          Icon(
+            Icons.bookmark_rounded,
+            size: 11,
+            color: foreground.withValues(alpha: .62),
+            semanticLabel: 'Kept in Moments',
+          ),
+          const SizedBox(width: 3),
+        ],
         Text(time, style: timeStyle),
-        if (mine) ...[
+        if (mine && !deleted) ...[
           const SizedBox(width: 4),
           Tooltip(
             message: receipt,
@@ -83,7 +106,27 @@ class MessageTile extends StatelessWidget {
     );
 
     Widget content;
-    if (kind == 'image' && mediaId != null) {
+    if (deleted) {
+      content = Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.block_rounded, size: 15, color: foreground),
+          const SizedBox(width: 6),
+          Flexible(
+            child: Text(
+              mine ? 'You deleted this message' : 'This message was deleted',
+              style: TextStyle(
+                color: foreground,
+                fontSize: 14.5,
+                fontStyle: FontStyle.italic,
+              ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          meta,
+        ],
+      );
+    } else if (kind == 'image' && mediaId != null) {
       content = GestureDetector(
         onTap: () => openPhoto(context, api, mediaId),
         child: Hero(
@@ -130,6 +173,7 @@ class MessageTile extends StatelessWidget {
         meta,
         time,
         timeStyle,
+        kept ? 14 : 0,
       );
     }
 
@@ -144,7 +188,7 @@ class MessageTile extends StatelessWidget {
             ],
           )
         : content;
-    final quote = message['replyToId'] == null
+    final quote = deleted || message['replyToId'] == null
         ? null
         : ReplyQuote(
             quoted: message['replyTo'] as Map<String, dynamic>?,
@@ -155,11 +199,12 @@ class MessageTile extends StatelessWidget {
 
     const round = Radius.circular(20);
     const tight = Radius.circular(6);
-    final base = mine ? c.mine : c.theirs;
+    final base = deleted ? c.background : (mine ? c.mine : c.theirs);
+    final gapBelow = joinsBelow ? 3.0 : 14.0;
     final bubble = AnimatedContainer(
       duration: const Duration(milliseconds: 280),
       curve: Curves.easeOut,
-      margin: EdgeInsets.only(bottom: joinsBelow ? 3 : 14),
+      margin: EdgeInsets.only(bottom: reactions.isEmpty ? gapBelow : 0),
       constraints: BoxConstraints(
         maxWidth: MediaQuery.sizeOf(context).width * .78,
       ),
@@ -170,7 +215,7 @@ class MessageTile extends StatelessWidget {
             : mine
             ? Color.lerp(base, c.onMine, .22)
             : Color.lerp(base, c.accent, .16),
-        border: mine ? null : Border.all(color: c.border),
+        border: mine && !deleted ? null : Border.all(color: c.border),
         borderRadius: BorderRadius.only(
           topLeft: !mine && joinsAbove ? tight : round,
           topRight: mine && joinsAbove ? tight : round,
@@ -200,17 +245,39 @@ class MessageTile extends StatelessWidget {
             ),
     );
 
+    final held = Semantics(
+      customSemanticsActions: reply == null
+          ? null
+          : {const CustomSemanticsAction(label: 'Reply'): reply},
+      onLongPressHint: options == null ? null : 'Message options',
+      child: GestureDetector(onLongPress: options, child: bubble),
+    );
     final aligned = SwipeToReply(
-      onReply: onReply,
+      onReply: reply,
       child: Align(
         alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
-        child: Semantics(
-          customSemanticsActions: onReply == null
-              ? null
-              : {const CustomSemanticsAction(label: 'Reply'): onReply!},
-          onLongPressHint: 'Message options',
-          child: GestureDetector(onLongPress: onOptions, child: bubble),
-        ),
+        child: reactions.isEmpty
+            ? held
+            : Column(
+                crossAxisAlignment: mine
+                    ? CrossAxisAlignment.end
+                    : CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  held,
+                  // Tucked under the bubble's edge, as in most messengers.
+                  Transform.translate(
+                    offset: const Offset(0, -7),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      child: ReactionPill(reactions: reactions, onTap: options),
+                    ),
+                  ),
+                  // The lifted pill still takes its full height in layout,
+                  // which already leaves 7px below it.
+                  SizedBox(height: joinsBelow ? 0 : gapBelow - 7),
+                ],
+              ),
       ),
     );
     if (!animate) return aligned;
@@ -233,8 +300,6 @@ class MessageTile extends StatelessWidget {
     );
   }
 
-  static const _textPadding = EdgeInsets.fromLTRB(14, 9, 12, 8);
-
   /// Message text with the time tucked into the end of its last line when
   /// there is room, or on a line of its own when there isn't. The text stays
   /// left-aligned even when a wider quote stretches the bubble.
@@ -245,6 +310,7 @@ class MessageTile extends StatelessWidget {
     Widget meta,
     String time,
     TextStyle timeStyle,
+    double extraMeta,
   ) {
     const gap = 10.0;
     final direction = Directionality.of(context);
@@ -255,7 +321,7 @@ class MessageTile extends StatelessWidget {
       textDirection: direction,
       textScaler: scaler,
     )..layout();
-    final metaWidth = stamp.width + (mine ? 18 : 0);
+    final metaWidth = stamp.width + (mine ? 18 : 0) + extraMeta;
     final metaHeight = stamp.height > 14 ? stamp.height : 14.0;
     stamp.dispose();
     final maxWidth =
@@ -290,6 +356,7 @@ class MessageTile extends StatelessWidget {
 /// One-line description of a message for quotes, the reply bar, and menus.
 String messageSnippet(Map<String, dynamic>? message) {
   if (message == null) return 'Message unavailable';
+  if (message['deleted'] == true) return 'Message deleted';
   return switch (message['kind']) {
     'image' => 'Photo',
     'video' => 'Video',
@@ -298,11 +365,62 @@ String messageSnippet(Map<String, dynamic>? message) {
 }
 
 IconData? snippetIcon(Map<String, dynamic>? message) =>
-    switch (message?['kind']) {
-      'image' => Icons.photo_outlined,
-      'video' => Icons.videocam_outlined,
-      _ => null,
-    };
+    message?['deleted'] == true
+    ? null
+    : switch (message?['kind']) {
+        'image' => Icons.photo_outlined,
+        'video' => Icons.videocam_outlined,
+        _ => null,
+      };
+
+/// The quick reactions offered when pressing and holding a message.
+const reactionChoices = ['❤️', '😂', '😮', '😢', '👍', '🔥'];
+
+/// Reactions shown under a bubble: each distinct emoji, plus a count when
+/// both people reacted.
+class ReactionPill extends StatelessWidget {
+  const ReactionPill({super.key, required this.reactions, this.onTap});
+  final List<Map<String, dynamic>> reactions;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.aida;
+    final emojis = reactions.map((r) => r['emoji'] as String).toSet();
+    return Semantics(
+      container: true,
+      button: onTap != null,
+      label: 'Reactions: ${reactions.map((r) => r['emoji']).join(' ')}',
+      excludeSemantics: true,
+      child: Material(
+        color: c.surface,
+        elevation: 1,
+        shadowColor: Colors.black26,
+        shape: StadiumBorder(side: BorderSide(color: c.border)),
+        child: InkWell(
+          customBorder: const StadiumBorder(),
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(emojis.join(), style: const TextStyle(fontSize: 14)),
+                if (reactions.length > 1) ...[
+                  const SizedBox(width: 3),
+                  Text(
+                    '${reactions.length}',
+                    style: TextStyle(fontSize: 11.5, color: c.muted),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
 
 /// The quoted message shown at the top of a reply.
 class ReplyQuote extends StatelessWidget {
