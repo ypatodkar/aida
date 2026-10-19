@@ -1,0 +1,12 @@
+services:
+  api:
+    build: ./server
+    restart: unless-stopped
+    env_file: ./server/.env
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - aida_data:/app/data
+
+volumes:
+  aida_data:

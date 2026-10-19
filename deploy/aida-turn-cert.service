@@ -1,0 +1,7 @@
+[Unit]
+Description=Refresh the Aida LiveKit TURN TLS certificate
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/aida/deploy/sync-turn-cert.sh

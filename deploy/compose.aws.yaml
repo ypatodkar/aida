@@ -1,0 +1,47 @@
+name: aida
+services:
+  api:
+    build: ../server
+    restart: unless-stopped
+    network_mode: host
+    env_file: ./.secrets/server.env
+    environment:
+      HOST: 127.0.0.1
+      NODE_OPTIONS: --max-old-space-size=160
+    mem_limit: 256m
+    volumes:
+      - aida_data:/app/data
+      - ./.secrets/firebase:/run/aida-firebase:ro
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: '2'
+
+  caddy:
+    image: caddy:2.11.7
+    restart: unless-stopped
+    network_mode: host
+    mem_limit: 128m
+    volumes:
+      - ./.secrets/Caddyfile:/etc/caddy/Caddyfile:ro
+      - /opt/aida/caddy-data:/data
+      - caddy_config:/config
+    logging: *logging
+
+  livekit:
+    image: livekit/livekit-server:v1.13.10
+    command: --config /etc/livekit.yaml
+    restart: unless-stopped
+    network_mode: host
+    mem_limit: 384m
+    environment:
+      GOMEMLIMIT: 300MiB
+    volumes:
+      - ./.secrets/livekit.yaml:/etc/livekit.yaml:ro
+      - /opt/aida/turn-certs:/certs:ro
+    logging: *logging
+
+volumes:
+  aida_data:
+  caddy_config:

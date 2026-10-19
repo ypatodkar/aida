@@ -1,0 +1,27 @@
+{
+    default_sni PUBLIC_IP
+    servers {
+        protocols h1 h2
+    }
+}
+
+PUBLIC_IP {
+    tls {
+        issuer acme {
+            dir https://acme-v02.api.letsencrypt.org/directory
+            profile shortlived
+        }
+    }
+    encode zstd gzip
+    @api path /health /v1/*
+    handle @api {
+        reverse_proxy 127.0.0.1:8080
+    }
+    @signaling path /rtc /rtc/*
+    handle @signaling {
+        reverse_proxy 127.0.0.1:7880
+    }
+    handle {
+        respond "Not found" 404
+    }
+}

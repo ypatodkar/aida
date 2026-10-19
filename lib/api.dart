@@ -1,0 +1,203 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:http/http.dart' as http;
+import 'package:web_socket_channel/io.dart';
+
+class ApiException implements Exception {
+  ApiException(this.message, this.status);
+
+  final String message;
+  final int status;
+
+  @override
+  String toString() => message;
+}
+
+class AidaApi {
+  AidaApi(this.baseUrl, {this.token});
+
+  final String baseUrl;
+  String? token;
+  final http.Client _client = http.Client();
+
+  Uri _uri(String path) => Uri.parse(baseUrl).resolve(path);
+
+  Future<Map<String, dynamic>> _request(
+    String method,
+    String path, {
+    Map<String, dynamic>? body,
+  }) async {
+    final request = http.Request(method, _uri(path));
+    request.headers['accept'] = 'application/json';
+    if (token != null) request.headers['authorization'] = 'Bearer $token';
+    if (body != null) {
+      request.headers['content-type'] = 'application/json';
+      request.body = jsonEncode(body);
+    }
+    final response = await http.Response.fromStream(
+      await _client.send(request).timeout(const Duration(seconds: 15)),
+    );
+    Map<String, dynamic> value;
+    try {
+      value = jsonDecode(response.body) as Map<String, dynamic>;
+    } catch (_) {
+      throw ApiException(
+        'Server returned an invalid response',
+        response.statusCode,
+      );
+    }
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw ApiException(
+        value['message']?.toString() ?? 'Request failed',
+        response.statusCode,
+      );
+    }
+    return value;
+  }
+
+  Future<Map<String, dynamic>> signInWithGoogle(String idToken) =>
+      _request('POST', '/v1/auth/google', body: {'idToken': idToken});
+
+  Future<Map<String, dynamic>> me() => _request('GET', '/v1/me');
+
+  Future<Map<String, dynamic>> setName(String name) =>
+      _request('PATCH', '/v1/me', body: {'name': name});
+
+  Future<Map<String, dynamic>> createInvite() =>
+      _request('POST', '/v1/invites');
+
+  Future<Map<String, dynamic>> lookupInvite(String code) =>
+      _request('GET', '/v1/invites/${Uri.encodeComponent(code)}');
+
+  Future<Map<String, dynamic>> acceptInvite(String code) =>
+      _request('POST', '/v1/invites/accept', body: {'code': code});
+
+  Future<void> revokeInvite() async {
+    await _request('DELETE', '/v1/invites');
+  }
+
+  Future<void> disconnect() async {
+    await _request('DELETE', '/v1/pair');
+  }
+
+  Future<Map<String, dynamic>> topics() => _request('GET', '/v1/topics');
+
+  Future<Map<String, dynamic>> createTopic(String name, String pairId) =>
+      _request('POST', '/v1/topics', body: {'name': name, 'pairId': pairId});
+
+  Future<Map<String, dynamic>> registerDevice(String deviceToken) =>
+      _request('POST', '/v1/devices', body: {'token': deviceToken});
+
+  Future<Map<String, dynamic>> message(String id) =>
+      _request('GET', '/v1/messages/$id');
+
+  Future<Map<String, dynamic>> messages({
+    int after = 0,
+    String topicId = 'general',
+  }) => _request(
+    'GET',
+    '/v1/messages?after=$after&topicId=${Uri.encodeComponent(topicId)}',
+  );
+
+  Future<Map<String, dynamic>> sendMessage(
+    String text,
+    String clientId, {
+    String topicId = 'general',
+    String? pairId,
+  }) => _request(
+    'POST',
+    '/v1/messages',
+    body: {
+      'text': text,
+      'clientId': clientId,
+      'topicId': topicId,
+      'pairId': ?pairId,
+    },
+  );
+
+  Future<void> acknowledgeMessages({
+    required String pairId,
+    required String topicId,
+    required int deliveredThrough,
+    required int readThrough,
+  }) async {
+    await _request(
+      'POST',
+      '/v1/receipts',
+      body: {
+        'pairId': pairId,
+        'topicId': topicId,
+        'deliveredThrough': deliveredThrough,
+        'readThrough': readThrough,
+      },
+    );
+  }
+
+  Future<Map<String, dynamic>> upload(
+    File file,
+    String mime, {
+    String topicId = 'general',
+    String? pairId,
+    void Function(double fraction)? onProgress,
+  }) async {
+    final length = await file.length();
+    final request = http.StreamedRequest('POST', _uri('/v1/media'));
+    request.contentLength = length;
+    request.headers['content-type'] = mime;
+    request.headers['x-topic-id'] = topicId;
+    if (pairId != null) request.headers['x-pair-id'] = pairId;
+    request.headers['x-file-name'] = file.uri.pathSegments.last;
+    request.headers['authorization'] = 'Bearer $token';
+    final responseFuture = _client.send(request);
+    var sent = 0;
+    await for (final chunk in file.openRead()) {
+      request.sink.add(chunk);
+      sent += chunk.length;
+      onProgress?.call(sent / length);
+    }
+    await request.sink.close();
+    final response = await http.Response.fromStream(await responseFuture);
+    final value = jsonDecode(response.body) as Map<String, dynamic>;
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw ApiException(
+        value['message']?.toString() ?? 'Upload failed',
+        response.statusCode,
+      );
+    }
+    return value;
+  }
+
+  Uri mediaUrl(String id) => _uri('/v1/media/$id');
+
+  Map<String, String> get mediaHeaders => {'authorization': 'Bearer $token'};
+
+  Future<Map<String, dynamic>> currentCall() =>
+      _request('GET', '/v1/calls/current');
+
+  Future<Map<String, dynamic>> startCall(String kind) =>
+      _request('POST', '/v1/calls', body: {'kind': kind});
+
+  Future<void> callAction(String id, String action) async {
+    await _request('POST', '/v1/calls/$id/$action');
+  }
+
+  Future<Map<String, dynamic>> joinCall(String id) =>
+      _request('POST', '/v1/calls/$id/join');
+
+  Future<void> signOut() async {
+    await _request('POST', '/v1/auth/signout');
+  }
+
+  IOWebSocketChannel live() {
+    final uri = _uri('/v1/live');
+    final wsUri = uri.replace(scheme: uri.scheme == 'https' ? 'wss' : 'ws');
+    return IOWebSocketChannel.connect(
+      wsUri,
+      headers: {'authorization': 'Bearer $token'},
+      pingInterval: const Duration(seconds: 25),
+    );
+  }
+
+  void close() => _client.close();
+}

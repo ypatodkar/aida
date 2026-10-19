@@ -1,0 +1,5 @@
+# Replace this host with a DNS name you control. Caddy obtains a TLS certificate.
+chat.example.com {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:8080
+}

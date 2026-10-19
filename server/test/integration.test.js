@@ -1,0 +1,364 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { WebSocket } from 'ws';
+import { createApp } from '../src/server.js';
+
+async function fixture(t, options = {}) {
+  const dataDir = mkdtempSync(join(tmpdir(), 'aida-test-'));
+  const codes = new Map();
+  const app = createApp({
+    dataDir,
+    secret: 'test-secret-with-at-least-thirty-two-characters',
+    sendEmail: async (email, code) => codes.set(email, code),
+    verifyGoogleIdToken: options.verifyGoogleIdToken,
+    sendPush: options.sendPush,
+    presenceTtl: options.presenceTtl,
+    typingTtl: options.typingTtl,
+    activityInterval: options.activityInterval,
+  });
+  await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${app.server.address().port}`;
+  t.after(async () => {
+    await app.close();
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+  async function request(path, { method = 'GET', token, body, headers = {} } = {}) {
+    const response = await fetch(base + path, {
+      method,
+      headers: {
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+        ...(body && !(body instanceof Uint8Array) ? { 'content-type': 'application/json' } : {}),
+        ...headers,
+      },
+      body: body instanceof Uint8Array ? body : body ? JSON.stringify(body) : undefined,
+    });
+    const contentType = response.headers.get('content-type') ?? '';
+    const value = contentType.includes('json') ? await response.json() : new Uint8Array(await response.arrayBuffer());
+    return { status: response.status, value };
+  }
+  async function login(email) {
+    assert.equal((await request('/v1/auth/start', { method: 'POST', body: { email } })).status, 200);
+    const result = await request('/v1/auth/verify', {
+      method: 'POST', body: { email, code: codes.get(email) },
+    });
+    assert.equal(result.status, 200);
+    return result.value.token;
+  }
+  return { base, request, login, codes, dataDir };
+}
+
+test('Google sign-in requires a verified account and links by stable subject', async t => {
+  const token = 'a'.repeat(120);
+  let identity = { sub: 'google-subject-123', email: 'google@example.com',
+    email_verified: true, name: 'Google User' };
+  const { request } = await fixture(t, {
+    verifyGoogleIdToken: async value => {
+      if (value !== token) throw new Error('bad token');
+      return identity;
+    },
+  });
+  const login = () => request('/v1/auth/google', { method: 'POST', body: { idToken: token } });
+  assert.equal((await request('/v1/auth/google', {
+    method: 'POST', body: { idToken: 'invalid' },
+  })).status, 400);
+  identity = { ...identity, email_verified: false };
+  assert.equal((await login()).status, 401);
+  identity = { ...identity, email_verified: true };
+  const first = await login();
+  assert.equal(first.status, 200);
+  const second = await login();
+  assert.equal(second.value.user.id, first.value.user.id);
+  identity = { ...identity, sub: 'different-google-subject' };
+  assert.equal((await login()).status, 409);
+});
+
+test('exclusive pairing, messaging, media, and disconnect deletion', async t => {
+  const { request, login, dataDir } = await fixture(t);
+  const alice = await login('alice@example.com');
+  const bob = await login('bob@example.com');
+  const third = await login('third@example.com');
+  const invite = await request('/v1/invites', { method: 'POST', token: alice });
+  assert.equal(invite.status, 201);
+  const accepted = await request('/v1/invites/accept', {
+    method: 'POST', token: bob, body: { code: invite.value.code },
+  });
+  assert.equal(accepted.status, 200);
+  assert.equal(accepted.value.pair.partner.name, 'alice');
+  const pairId = accepted.value.pair.id;
+  assert.equal((await request('/v1/invites', { method: 'POST', token: alice })).status, 409);
+  assert.equal((await request('/v1/messages', { token: third })).status, 409);
+
+  const sent = await request('/v1/messages', {
+    method: 'POST', token: alice, body: { text: 'hello', clientId: 'message_123' },
+  });
+  assert.equal(sent.status, 201);
+  const replay = await request('/v1/messages', {
+    method: 'POST', token: alice, body: { text: 'hello', clientId: 'message_123' },
+  });
+  assert.equal(replay.value.id, sent.value.id);
+  const upload = await request('/v1/media', {
+    method: 'POST', token: bob, body: new Uint8Array([1, 2, 3, 4]),
+    headers: { 'content-type': 'image/png', 'x-file-name': 'photo.png' },
+  });
+  assert.equal(upload.status, 201);
+  const mediaId = upload.value.mediaId;
+  assert.deepEqual((await request(`/v1/media/${mediaId}`, { token: alice })).value,
+    new Uint8Array([1, 2, 3, 4]));
+  assert.equal((await request(`/v1/media/${mediaId}`, { token: third })).status, 409);
+  assert.equal((await request('/v1/messages', { token: bob })).value.messages.length, 2);
+
+  assert.equal((await request('/v1/pair', { method: 'DELETE', token: alice })).status, 200);
+  const db = new DatabaseSync(join(dataDir, 'aida.sqlite'));
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM pairs WHERE id = ?').get(pairId).count, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages WHERE pair_id = ?').get(pairId).count, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM media WHERE pair_id = ?').get(pairId).count, 0);
+  db.close();
+  assert.equal(existsSync(join(dataDir, 'media', pairId)), false);
+  assert.equal((await request('/v1/messages', { token: bob })).status, 409);
+  assert.equal((await request(`/v1/media/${mediaId}`, { token: bob })).status, 409);
+  assert.equal((await request('/v1/me', { token: bob })).value.pair, null);
+  const again = await request('/v1/invites', { method: 'POST', token: bob });
+  assert.equal((await request('/v1/invites/accept', {
+    method: 'POST', token: alice, body: { code: again.value.code },
+  })).status, 200);
+  assert.deepEqual((await request('/v1/messages', { token: alice })).value.messages, []);
+});
+
+test('simultaneous invite acceptance creates only one pair', async t => {
+  const { request, login } = await fixture(t);
+  const owner = await login('owner@example.com');
+  const a = await login('a@example.com');
+  const b = await login('b@example.com');
+  const invite = await request('/v1/invites', { method: 'POST', token: owner });
+  const results = await Promise.all([a, b].map(token => request('/v1/invites/accept', {
+    method: 'POST', token, body: { code: invite.value.code },
+  })));
+  assert.deepEqual(results.map(r => r.status).sort(), [200, 404]);
+  const paired = await Promise.all([a, b].map(token => request('/v1/me', { token })));
+  assert.equal(paired.filter(r => r.value.pair).length, 1);
+});
+
+test('live socket receives message changes', async t => {
+  const { base, request, login } = await fixture(t);
+  const a = await login('socket-a@example.com');
+  const b = await login('socket-b@example.com');
+  const invite = await request('/v1/invites', { method: 'POST', token: a });
+  await request('/v1/invites/accept', { method: 'POST', token: b, body: { code: invite.value.code } });
+  const ws = new WebSocket(base.replace('http', 'ws') + '/v1/live', {
+    headers: { authorization: `Bearer ${b}` },
+  });
+  t.after(() => ws.close());
+  await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+  const event = new Promise(resolve => {
+    ws.on('message', raw => {
+      const message = JSON.parse(raw.toString());
+      if (message.type === 'messages_changed') resolve(message);
+    });
+  });
+  await request('/v1/messages', {
+    method: 'POST', token: a, body: { text: 'ping', clientId: 'socket_msg_1' },
+  });
+  assert.equal((await event).type, 'messages_changed');
+});
+
+test('wrong email codes are limited', async t => {
+  const { request } = await fixture(t);
+  await request('/v1/auth/start', { method: 'POST', body: { email: 'wrong@example.com' } });
+  for (let attempt = 0; attempt < 5; attempt++) {
+    assert.equal((await request('/v1/auth/verify', {
+      method: 'POST', body: { email: 'wrong@example.com', code: '000000' },
+    })).status, 401);
+  }
+  assert.equal((await request('/v1/auth/verify', {
+    method: 'POST', body: { email: 'wrong@example.com', code: '000000' },
+  })).status, 401);
+});
+
+
+test('shared topics isolate messages and media; old notification replies cannot cross pair boundaries', async t => {
+  const f = await fixture(t);
+  const alice = await f.login('topics-a@example.com');
+  const bob = await f.login('topics-b@example.com');
+  const eve = await f.login('topics-e@example.com');
+  const invite = (await f.request('/v1/invites', { method: 'POST', token: alice })).value;
+  const paired = await f.request('/v1/invites/accept', { method: 'POST', token: bob, body: { code: invite.code } });
+  const pairId = paired.value.pair.id;
+  const topic = await f.request('/v1/topics', { method: 'POST', token: alice, body: { name: 'Trip', pairId } });
+  assert.equal(topic.status, 201);
+  assert.equal((await f.request('/v1/topics', { token: bob })).value.topics[1].name, 'Trip');
+  assert.equal((await f.request('/v1/topics', { token: eve })).status, 409);
+  assert.equal((await f.request('/v1/topics', { method: 'POST', token: bob, body: { name: 'trip' } })).status, 409);
+  const everyday = await f.request('/v1/messages', { method: 'POST', token: alice,
+    body: { text: 'Old clients keep working', clientId: 'everyday-123' } });
+  assert.equal(everyday.value.topicId, 'general');
+  const trip = await f.request('/v1/messages', { method: 'POST', token: bob,
+    body: { text: 'Book the tickets', clientId: 'trip-msg-123', topicId: topic.value.id, pairId } });
+  assert.equal(trip.status, 201);
+  const upload = await f.request('/v1/media', { method: 'POST', token: alice, body: new Uint8Array([1,2,3]),
+    headers: { 'content-type': 'image/png', 'x-topic-id': topic.value.id, 'x-pair-id': pairId } });
+  assert.equal(upload.status, 201);
+  assert.equal(upload.value.topicId, topic.value.id);
+  assert.equal((await f.request('/v1/messages?topicId=general', { token: alice })).value.messages.length, 1);
+  assert.equal((await f.request('/v1/messages?topicId='+topic.value.id, { token: alice })).value.messages.length, 2);
+  assert.equal((await f.request('/v1/messages?topicId=not-a-topic', { token: bob })).status, 404);
+  assert.equal((await f.request('/v1/messages/'+trip.value.id, { token: alice })).value.topicName, 'Trip');
+  assert.equal((await f.request('/v1/messages', { method: 'POST', token: bob,
+    body: { text: 'wrong topic', clientId: 'trip-msg-123', topicId: 'general', pairId } })).status, 409);
+  await f.request('/v1/pair', { method: 'DELETE', token: alice });
+  const nextInvite = (await f.request('/v1/invites', { method: 'POST', token: alice })).value;
+  await f.request('/v1/invites/accept', { method: 'POST', token: eve, body: { code: nextInvite.code } });
+  assert.equal((await f.request('/v1/messages', { method: 'POST', token: alice,
+    body: { text: 'stale reply', clientId: 'stale-reply-123', pairId, topicId: 'general' } })).status, 409);
+  assert.equal((await f.request('/v1/messages/'+trip.value.id, { token: alice })).status, 404);
+  assert.equal((await f.request('/v1/topics', { token: alice })).value.topics.length, 1);
+  const db = new DatabaseSync(join(f.dataDir, 'aida.sqlite'));
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM topics WHERE pair_id = ?').get(pairId).n, 0);
+  db.close();
+});
+
+test('notifications target the recipient device, contain no message text, and stop after sign-out', async t => {
+  const deliveries = [];
+  const f = await fixture(t, { sendPush: async (token, data) => { deliveries.push({token,data}); return true; } });
+  const alice = await f.login('push-a@example.com');
+  const bob = await f.login('push-b@example.com');
+  const device = 'test-notification-device-token-123456789';
+  assert.equal((await f.request('/v1/devices', { method: 'POST', token: bob, body: { token: device } })).value.enabled, true);
+  const invite = (await f.request('/v1/invites', { method: 'POST', token: alice })).value;
+  await f.request('/v1/invites/accept', { method: 'POST', token: bob, body: { code: invite.code } });
+  const sent = await f.request('/v1/messages', { method: 'POST', token: alice,
+    body: { text: 'Private message', clientId: 'push-message-123' } });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].token, device);
+  assert.equal(deliveries[0].data.messageId, String(sent.value.id));
+  assert.equal(JSON.stringify(deliveries[0]).includes('Private message'), false);
+  await f.request('/v1/auth/signout', { method: 'POST', token: bob });
+  await f.request('/v1/messages', { method: 'POST', token: alice,
+    body: { text: 'No notification after signout', clientId: 'push-message-456' } });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(deliveries.length, 1);
+});
+
+async function liveClient(base, token) {
+  const ws = new WebSocket(base.replace('http', 'ws') + '/v1/live', {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  const events = [];
+  ws.on('message', raw => events.push(JSON.parse(raw)));
+  await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+  return {
+    ws, events,
+    send: event => ws.send(JSON.stringify(event)),
+    async take(predicate) {
+      const deadline = Date.now() + 3500;
+      while (Date.now() < deadline) {
+        const index = events.findIndex(predicate);
+        if (index >= 0) return events.splice(index, 1)[0];
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert.fail('Expected live event did not arrive');
+    },
+  };
+}
+
+test('typing is ephemeral, scoped to the pair/topic, and presence aggregates foreground devices', async t => {
+  const f = await fixture(t, { presenceTtl: 1800, typingTtl: 200, activityInterval: 20 });
+  const a = await f.login('live-a@example.com');
+  const b = await f.login('live-b@example.com');
+  const outsider = await f.login('live-e@example.com');
+  const invite = (await f.request('/v1/invites', { method: 'POST', token: a })).value;
+  const pairId = (await f.request('/v1/invites/accept', { method: 'POST', token: b, body: { code: invite.code } })).value.pair.id;
+  const trip = (await f.request('/v1/topics', { method: 'POST', token: a, body: { pairId, name: 'Trip' } })).value.id;
+  const [first, second, partner, stranger] = await Promise.all([a, a, b, outsider].map(token => liveClient(f.base, token)));
+  try {
+    first.send({ type: 'presence', active: true });
+    await partner.take(e => e.type === 'presence' && e.online);
+    assert.equal((await f.request('/v1/me', { token: b })).value.pair.partner.online, true);
+    second.send({ type: 'presence', active: true });
+    first.send({ type: 'typing', pairId, topicId: trip, typing: true, userId: 'spoofed-user' });
+    const typing = await partner.take(e => e.type === 'typing' && e.typing);
+    assert.equal(typing.topicId, trip);
+    assert.notEqual(typing.userId, 'spoofed-user');
+    await partner.take(e => e.type === 'typing' && !e.typing); // expires even with an open socket
+    first.send({ type: 'typing', pairId, topicId: 'general', typing: true });
+    await partner.take(e => e.type === 'typing' && e.typing);
+    first.send({ type: 'presence', active: false });
+    await partner.take(e => e.type === 'typing' && !e.typing);
+    assert.equal((await f.request('/v1/me', { token: b })).value.pair.partner.online, true);
+    second.ws.close();
+    const offline = await partner.take(e => e.type === 'presence' && !e.online);
+    assert.ok(offline.lastSeenAt > 0);
+    assert.equal((await f.request('/v1/me', { token: b })).value.pair.partner.online, false);
+    first.send({ type: 'presence', active: true });
+    await partner.take(e => e.type === 'presence' && e.online);
+    await partner.take(e => e.type === 'presence' && !e.online); // foreground heartbeat lease expires
+    first.send({ type: 'typing', pairId: 'old-pair', topicId: 'general', typing: true });
+    first.send({ type: 'typing', pairId, topicId: 'not-a-topic', typing: true });
+    first.send({ type: 'presence', active: true });
+    await partner.take(e => e.type === 'presence' && e.online); // barrier after invalid events
+    assert.equal(partner.events.some(e => e.type === 'typing' && e.typing), false);
+    assert.equal(stranger.events.some(e => ['presence', 'typing'].includes(e.type)), false);
+    await f.request('/v1/pair', { method: 'DELETE', token: a });
+    first.send({ type: 'typing', pairId, topicId: 'general', typing: true });
+    await partner.take(e => e.type === 'pair_changed');
+    assert.equal(partner.events.some(e => e.type === 'typing' && e.typing), false);
+  } finally {
+    for (const client of [first, second, partner, stranger]) client.ws.terminate();
+  }
+});
+
+test('delivery and read receipts advance independently, survive reconnects, and cannot cross topics or connections', async t => {
+  const f = await fixture(t);
+  const a = await f.login('receipt-a@example.com');
+  const b = await f.login('receipt-b@example.com');
+  const outsider = await f.login('receipt-e@example.com');
+  const invite = (await f.request('/v1/invites', { method: 'POST', token: a })).value;
+  const pairId = (await f.request('/v1/invites/accept', { method: 'POST', token: b, body: { code: invite.code } })).value.pair.id;
+  const trip = (await f.request('/v1/topics', { method: 'POST', token: a, body: { pairId, name: 'Trip' } })).value.id;
+  const send = async (topicId, clientId) => (await f.request('/v1/messages', { method: 'POST', token: a,
+    body: { pairId, topicId, clientId, text: 'Receipt test' } })).value.id;
+  const firstId = await send('general', 'receipt-first');
+  const tripId = await send(trip, 'receipt-trip');
+  const secondId = await send('general', 'receipt-second');
+  const ack = (token, body) => f.request('/v1/receipts', { method: 'POST', token, body: { pairId, topicId: 'general', ...body } });
+  const receipts = async (topicId = 'general') => (await f.request(`/v1/messages?after=${secondId}&topicId=${topicId}`, { token: a })).value.partnerReceipt;
+  const live = await liveClient(f.base, a);
+  try {
+    // Fetching messages alone (e.g. background activity) must never mark them as read.
+    await f.request('/v1/messages', { token: b });
+    assert.deepEqual(await receipts(), { deliveredThrough: 0, readThrough: 0 });
+    assert.equal((await ack(b, { deliveredThrough: secondId })).status, 200);
+    const delivered = await live.take(e => e.type === 'receipts_changed');
+    assert.equal(delivered.deliveredThrough, secondId);
+    assert.equal(delivered.readThrough, 0);
+    assert.equal((await ack(b, { deliveredThrough: firstId, readThrough: firstId })).status, 200);
+    assert.deepEqual(await receipts(), { deliveredThrough: secondId, readThrough: firstId });
+    await ack(b, { deliveredThrough: 0, readThrough: 0 });
+    assert.deepEqual(await receipts(), { deliveredThrough: secondId, readThrough: firstId });
+    assert.deepEqual(await receipts(trip), { deliveredThrough: 0, readThrough: 0 });
+    assert.equal((await ack(b, { deliveredThrough: tripId })).status, 400);
+    assert.equal((await ack(b, { readThrough: secondId + 999 })).status, 400);
+    assert.equal((await ack(b, { readThrough: 1.5 })).status, 400);
+    assert.equal((await ack(outsider, { readThrough: secondId })).status, 409);
+    await ack(a, { readThrough: secondId });
+    assert.equal((await receipts()).readThrough, firstId); // sender cannot acknowledge for recipient
+    await ack(b, { readThrough: secondId });
+    assert.deepEqual(await receipts(), { deliveredThrough: secondId, readThrough: secondId });
+    live.ws.close();
+    const reconnected = await liveClient(f.base, a);
+    assert.deepEqual(await receipts(), { deliveredThrough: secondId, readThrough: secondId });
+    reconnected.ws.terminate();
+    await f.request('/v1/pair', { method: 'DELETE', token: a });
+    const db = new DatabaseSync(join(f.dataDir, 'aida.sqlite'));
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM receipts').get().n, 0);
+    db.close();
+    const nextInvite = (await f.request('/v1/invites', { method: 'POST', token: a })).value;
+    await f.request('/v1/invites/accept', { method: 'POST', token: b, body: { code: nextInvite.code } });
+    assert.equal((await ack(b, { readThrough: secondId })).status, 409);
+    assert.deepEqual(await receipts(), { deliveredThrough: 0, readThrough: 0 });
+  } finally { live.ws.terminate(); }
+});

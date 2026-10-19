@@ -1,0 +1,14 @@
+# Replace with your VM's stable public IPv4 address. Use Caddy 2.11.7+
+# and ports 80/443 open. Let's Encrypt IP certificates use the shortlived profile.
+{
+    default_sni 203.0.113.10
+}
+203.0.113.10 {
+    tls {
+        issuer acme {
+            profile shortlived
+        }
+    }
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:8080
+}
