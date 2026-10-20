@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Transform } from 'node:stream';
@@ -31,7 +31,14 @@ class ApiError extends Error {
 const fail = (status, code, message) => { throw new ApiError(status, code, message); };
 const now = () => Date.now();
 const hash = value => createHash('sha256').update(value).digest('hex');
-const publicUser = user => ({ id: user.id, name: user.name });
+const publicUser = user => ({ id: user.id, name: user.name, photoAt: user.photo_at ?? null });
+const MAX_PHOTO = 5 * 1024 * 1024;
+// Profile photos must really be the image type they claim to be.
+const PHOTO_SIGNATURES = new Map([
+  ['image/jpeg', bytes => bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff],
+  ['image/png', bytes => bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))],
+  ['image/webp', bytes => bytes.toString('latin1', 0, 4) === 'RIFF' && bytes.toString('latin1', 8, 12) === 'WEBP'],
+]);
 const cleanEmail = value => String(value ?? '').trim().toLowerCase();
 
 function inviteCode() {
@@ -76,6 +83,8 @@ function bearer(request) {
 export function createApp(options = {}) {
   const dataDir = resolve(options.dataDir ?? process.env.DATA_DIR ?? './data');
   const mediaDir = join(dataDir, 'media');
+  const avatarDir = join(dataDir, 'avatars');
+  mkdirSync(avatarDir, { recursive: true });
   mkdirSync(mediaDir, { recursive: true });
   const db = openDatabase(join(dataDir, 'aida.sqlite'));
   const secret = options.secret ?? process.env.APP_SECRET ??
@@ -155,9 +164,17 @@ export function createApp(options = {}) {
     const partner = db.prepare('SELECT * FROM users WHERE id = ?').get(otherId(pair, user.id));
     return {
       user: publicUser(refreshed),
-      pair: { id: pair.id, partner: { ...publicUser(partner), ...presence(partner) }, createdAt: pair.created_at },
+      pair: {
+        id: pair.id, createdAt: pair.created_at,
+        partner: { ...publicUser(partner), ...presence(partner), nickname: nicknameFor(pair.id, user.id) },
+      },
       invite: null,
     };
+  }
+
+  /** What this person calls their partner; private to them. */
+  function nicknameFor(pairId, userId) {
+    return db.prepare('SELECT nickname FROM nicknames WHERE pair_id = ? AND user_id = ?').get(pairId, userId)?.nickname ?? null;
   }
 
   function presence(user) {
@@ -242,6 +259,13 @@ export function createApp(options = {}) {
     for (const reply of db.prepare('SELECT id FROM messages WHERE pair_id = ? AND reply_to_id = ?').all(pairId, messageId)) {
       bump(pairId, reply.id);
     }
+  }
+
+  /** A photo change shows on both phones; each refreshes its pairing state. */
+  function notifyProfile(user) {
+    const fresh = db.prepare('SELECT pair_id FROM users WHERE id = ?').get(user.id);
+    const pair = fresh.pair_id && db.prepare('SELECT * FROM pairs WHERE id = ?').get(fresh.pair_id);
+    notify(pair ? [pair.a_id, pair.b_id] : [user.id], 'profile_changed');
   }
 
   function messageUpdated(pair, message) {
@@ -474,6 +498,65 @@ export function createApp(options = {}) {
       return send(response, 200, ownState(user));
     }
 
+    if (method === 'PUT' && path === '/v1/pair/nickname') {
+      const pair = currentPair(user);
+      const body = await readJson(request);
+      const nickname = String(body.nickname ?? '').trim();
+      if (nickname.length > 40) fail(400, 'invalid_nickname', 'Nickname must be at most 40 characters');
+      if (nickname) {
+        db.prepare(`INSERT INTO nicknames (pair_id, user_id, nickname) VALUES (?, ?, ?)
+          ON CONFLICT(pair_id, user_id) DO UPDATE SET nickname = excluded.nickname`).run(pair.id, user.id, nickname);
+      } else {
+        db.prepare('DELETE FROM nicknames WHERE pair_id = ? AND user_id = ?').run(pair.id, user.id);
+      }
+      notify([user.id], 'profile_changed');
+      return send(response, 200, ownState(user));
+    }
+    if (method === 'PUT' && path === '/v1/me/photo') {
+      const mime = String(request.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
+      const looksRight = PHOTO_SIGNATURES.get(mime);
+      if (!looksRight) fail(415, 'unsupported_photo', 'Use a JPEG, PNG, or WebP photo');
+      const declared = Number(request.headers['content-length']);
+      if (!Number.isSafeInteger(declared) || declared < 1 || declared > MAX_PHOTO) fail(413, 'too_large', 'Photo must be under 5 MB');
+      const chunks = [];
+      let size = 0;
+      for await (const chunk of request) {
+        size += chunk.length;
+        if (size > MAX_PHOTO) fail(413, 'too_large', 'Photo must be under 5 MB');
+        chunks.push(chunk);
+      }
+      const bytes = Buffer.concat(chunks);
+      if (bytes.length !== declared || !looksRight(bytes)) fail(400, 'bad_photo', 'That file is not a valid photo');
+      const file = join(avatarDir, user.id);
+      writeFileSync(file + '.tmp', bytes);
+      renameSync(file + '.tmp', file);
+      db.prepare('UPDATE users SET photo_at = ?, photo_mime = ? WHERE id = ?').run(now(), mime, user.id);
+      notifyProfile(user);
+      return send(response, 200, ownState(user));
+    }
+    if (method === 'DELETE' && path === '/v1/me/photo') {
+      rmSync(join(avatarDir, user.id), { force: true });
+      db.prepare('UPDATE users SET photo_at = NULL, photo_mime = NULL WHERE id = ?').run(user.id);
+      notifyProfile(user);
+      return send(response, 200, ownState(user));
+    }
+    const photoMatch = /^\/v1\/users\/([0-9a-f-]{36})\/photo$/.exec(path);
+    if (method === 'GET' && photoMatch) {
+      const id = photoMatch[1];
+      const me = db.prepare('SELECT pair_id FROM users WHERE id = ?').get(user.id);
+      const pair = me.pair_id && db.prepare("SELECT * FROM pairs WHERE id = ? AND state = 'active'").get(me.pair_id);
+      const allowed = id === user.id || (pair && otherId(pair, user.id) === id);
+      const owner = allowed && db.prepare('SELECT photo_mime FROM users WHERE id = ? AND photo_at IS NOT NULL').get(id);
+      const file = join(avatarDir, id);
+      if (!owner || !existsSync(file)) fail(404, 'not_found', 'No photo');
+      response.writeHead(200, {
+        'content-type': owner.photo_mime, 'content-length': statSync(file).size,
+        'cache-control': 'private, max-age=86400', 'x-content-type-options': 'nosniff',
+      });
+      createReadStream(file).pipe(response);
+      return;
+    }
+
     if (method === 'POST' && path === '/v1/invites') {
       if (user.pair_id) fail(409, 'already_paired', 'Disconnect before inviting someone else');
       let code;
@@ -537,6 +620,7 @@ export function createApp(options = {}) {
       transaction(db, () => {
         db.prepare('UPDATE users SET pair_id = NULL WHERE id IN (?, ?) AND pair_id = ?')
           .run(pair.a_id, pair.b_id, pair.id);
+        db.prepare('DELETE FROM nicknames WHERE pair_id = ?').run(pair.id);
         db.prepare('DELETE FROM reactions WHERE pair_id = ?').run(pair.id);
         db.prepare('DELETE FROM kept WHERE pair_id = ?').run(pair.id);
         db.prepare('DELETE FROM messages WHERE pair_id = ?').run(pair.id);
@@ -584,7 +668,23 @@ export function createApp(options = {}) {
       if (!message) fail(404, 'not_found', 'Message unavailable');
       const sender = db.prepare('SELECT name FROM users WHERE id = ?').get(message.sender_id);
       const topic = db.prepare('SELECT name FROM topics WHERE id = ? AND pair_id = ?').get(message.topic_id, pair.id);
-      return send(response, 200, { ...messageForClient(message), senderName: sender.name, topicName: topic?.name ?? 'Everyday' });
+      const senderName = message.sender_id === user.id ? sender.name : nicknameFor(pair.id, user.id) ?? sender.name;
+      return send(response, 200, { ...messageForClient(message), senderName, topicName: topic?.name ?? 'Everyday' });
+    }
+    if (method === 'GET' && path === '/v1/unread') {
+      const pair = currentPair(user);
+      const topicId = validateTopic(pair, url.searchParams.get('topicId') ?? 'general');
+      const { readThrough } = receipt(pair.id, user.id, topicId);
+      const partner = db.prepare('SELECT * FROM users WHERE id = ?').get(otherId(pair, user.id));
+      const rows = db.prepare(`SELECT * FROM messages WHERE pair_id = ? AND topic_id = ? AND id > ?
+        AND deleted_at IS NULL ORDER BY id DESC LIMIT 12`).all(pair.id, topicId, readThrough).reverse();
+      const unreadCount = db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE pair_id = ? AND topic_id = ? AND id > ?
+        AND deleted_at IS NULL AND sender_id = ?`).get(pair.id, topicId, readThrough, partner.id).n;
+      const topic = db.prepare('SELECT name FROM topics WHERE id = ? AND pair_id = ?').get(topicId, pair.id);
+      return send(response, 200, {
+        messages: rows.map(messageForClient), unreadCount, readThrough,
+        topicName: topic?.name ?? 'Everyday', partnerName: nicknameFor(pair.id, user.id) ?? partner.name,
+      });
     }
     if (method === 'GET' && path === '/v1/messages/changes') {
       const pair = currentPair(user);

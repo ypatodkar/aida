@@ -527,3 +527,82 @@ test('reactions, edits, deletions, and Moments keeps sync through the change fee
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 0);
   db.close();
 });
+
+test('private nicknames, profile photos, and unread history for notifications', async t => {
+  const f = await fixture(t);
+  const alice = await f.login('profile-a@example.com');
+  const bob = await f.login('profile-b@example.com');
+  const eve = await f.login('profile-e@example.com');
+  await f.request('/v1/me', { method: 'PATCH', token: bob, body: { name: 'Bob' } });
+  const invite = (await f.request('/v1/invites', { method: 'POST', token: alice })).value;
+  const pairId = (await f.request('/v1/invites/accept', { method: 'POST', token: bob,
+    body: { code: invite.code } })).value.pair.id;
+  const aliceId = (await f.request('/v1/me', { token: alice })).value.user.id;
+  const bobId = (await f.request('/v1/me', { token: bob })).value.user.id;
+
+  // A nickname is seen only by the person who set it, and can be cleared.
+  const nick = (token, nickname) => f.request('/v1/pair/nickname', { method: 'PUT', token, body: { nickname } });
+  assert.equal((await nick(alice, 'x'.repeat(41))).status, 400);
+  const named = await nick(alice, '  Love  ');
+  assert.equal(named.status, 200);
+  assert.equal(named.value.pair.partner.nickname, 'Love');
+  assert.equal(named.value.pair.partner.name, 'Bob');
+  assert.equal((await f.request('/v1/me', { token: bob })).value.pair.partner.nickname, null);
+  const sent = (await f.request('/v1/messages', { method: 'POST', token: bob,
+    body: { text: 'Hi', clientId: 'profile-hi-1', pairId } })).value;
+  assert.equal((await f.request(`/v1/messages/${sent.id}`, { token: alice })).value.senderName, 'Love');
+  assert.equal((await nick(alice, '')).value.pair.partner.nickname, null);
+  assert.equal((await f.request(`/v1/messages/${sent.id}`, { token: alice })).value.senderName, 'Bob');
+  await nick(alice, 'Love');
+
+  // Profile photos: images only, size-limited, visible to yourself and your partner.
+  const png = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3]);
+  const upload = (token, body, type = 'image/png') => f.request('/v1/me/photo', { method: 'PUT', token, body,
+    headers: { 'content-type': type } });
+  assert.equal((await upload(bob, png, 'video/mp4')).status, 415);
+  assert.equal((await upload(bob, new Uint8Array(5 * 1024 * 1024 + 1))).status, 413);
+  const uploaded = await upload(bob, png);
+  assert.equal(uploaded.status, 200);
+  const photoAt = uploaded.value.user.photoAt;
+  assert.equal(typeof photoAt, 'number');
+  assert.equal((await f.request('/v1/me', { token: alice })).value.pair.partner.photoAt, photoAt);
+  const seen = await f.request(`/v1/users/${bobId}/photo`, { token: alice });
+  assert.equal(seen.status, 200);
+  assert.deepEqual([...seen.value], [...png]);
+  assert.equal((await f.request(`/v1/users/${bobId}/photo`, { token: bob })).status, 200);
+  assert.equal((await f.request(`/v1/users/${bobId}/photo`, { token: eve })).status, 404);
+  assert.equal((await f.request(`/v1/users/${aliceId}/photo`, { token: bob })).status, 404);
+
+  // Unread history: everything after my read point, oldest first, without deleted messages.
+  for (let i = 1; i <= 14; i++) {
+    await f.request('/v1/messages', { method: 'POST', token: bob,
+      body: { text: `Note ${i}`, clientId: `profile-note-${i}`, pairId } });
+  }
+  const mine = (await f.request('/v1/messages', { method: 'POST', token: alice,
+    body: { text: 'Replying from the notification', clientId: 'profile-mine-1', pairId } })).value;
+  const doomed = (await f.request('/v1/messages', { method: 'POST', token: bob,
+    body: { text: 'Never mind', clientId: 'profile-doomed-1', pairId } })).value;
+  await f.request(`/v1/messages/${doomed.id}`, { method: 'DELETE', token: bob });
+  const unread = (await f.request('/v1/unread?topicId=general', { token: alice })).value;
+  assert.equal(unread.unreadCount, 15);
+  assert.equal(unread.messages.length, 12);
+  assert.equal(unread.messages.at(-1).id, mine.id);
+  assert.equal(unread.messages.at(-2).text, 'Note 14');
+  assert.ok(unread.messages.every(m => !m.deleted));
+  assert.equal(unread.topicName, 'Everyday');
+  assert.equal(unread.partnerName, 'Love');
+  await f.request('/v1/receipts', { method: 'POST', token: alice,
+    body: { pairId, topicId: 'general', deliveredThrough: mine.id, readThrough: mine.id } });
+  assert.deepEqual((await f.request('/v1/unread?topicId=general', { token: alice })).value.messages, []);
+  assert.equal((await f.request('/v1/unread?topicId=nope', { token: alice })).status, 404);
+
+  // Removing a photo, and disconnecting, clear what the other person can see.
+  assert.equal((await f.request('/v1/me/photo', { method: 'DELETE', token: bob })).value.user.photoAt, null);
+  assert.equal((await f.request(`/v1/users/${bobId}/photo`, { token: alice })).status, 404);
+  await upload(bob, png);
+  await f.request('/v1/pair', { method: 'DELETE', token: alice });
+  assert.equal((await f.request(`/v1/users/${bobId}/photo`, { token: alice })).status, 404);
+  const db = new DatabaseSync(join(f.dataDir, 'aida.sqlite'));
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM nicknames').get().n, 0);
+  db.close();
+});

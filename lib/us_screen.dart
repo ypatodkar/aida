@@ -1,6 +1,11 @@
 import 'package:flutter/material.dart';
 
+import 'dart:io';
+
+import 'package:path_provider/path_provider.dart';
+
 import 'design.dart';
+import 'updates.dart';
 
 /// The couple's profile: who you're connected to, how the app looks, privacy,
 /// and account controls.
@@ -23,6 +28,11 @@ class UsScreen extends StatefulWidget {
     required this.onSignOut,
     required this.onDisconnect,
     required this.version,
+    required this.partnerLabel,
+    required this.photoOf,
+    required this.onNickname,
+    required this.onPhoto,
+    this.updater,
   });
 
   final Map<String, dynamic>? Function() state;
@@ -37,6 +47,13 @@ class UsScreen extends StatefulWidget {
   final Future<void> Function() onSignOut;
   final Future<void> Function() onDisconnect;
   final String version;
+  final String Function(Map<String, dynamic> partner) partnerLabel;
+  final ImageProvider? Function(Map<String, dynamic> person) photoOf;
+  final Future<void> Function() onNickname;
+  final Future<void> Function() onPhoto;
+
+  /// Checks GitHub for new versions; absent in design previews.
+  final AppUpdater? updater;
 
   @override
   State<UsScreen> createState() => _UsScreenState();
@@ -60,7 +77,10 @@ class _UsScreenState extends State<UsScreen> {
     final user = state['user'] as Map<String, dynamic>;
     final partner = pair['partner'] as Map<String, dynamic>;
     final me = user['name']?.toString() ?? '';
-    final them = partner['name']?.toString() ?? '';
+    final them = widget.partnerLabel(partner);
+    final realName = partner['name']?.toString() ?? '';
+    final myPhoto = widget.photoOf(user);
+    final theirPhoto = widget.photoOf(partner);
     final since = pair['createdAt'] as int?;
     final together = since == null ? null : Together(since);
     return Scaffold(
@@ -84,7 +104,22 @@ class _UsScreenState extends State<UsScreen> {
         padding: const EdgeInsets.fromLTRB(20, 8, 20, 40),
         children: [
           const SizedBox(height: 12),
-          Center(child: CoupleAvatars(me, them, size: 76)),
+          Center(
+            child: Semantics(
+              button: true,
+              label: 'Change your photo',
+              child: GestureDetector(
+                onTap: () => _then(widget.onPhoto),
+                child: CoupleAvatars(
+                  me,
+                  them,
+                  size: 76,
+                  mePhoto: myPhoto,
+                  partnerPhoto: theirPhoto,
+                ),
+              ),
+            ),
+          ),
           const SizedBox(height: 18),
           Text(
             '$me & $them',
@@ -104,9 +139,13 @@ class _UsScreenState extends State<UsScreen> {
           _Group(
             children: [
               _Row(
-                leading: PersonAvatar(them, size: 36),
+                leading: PersonAvatar(them, size: 36, photo: theirPhoto),
                 title: them,
-                subtitle: widget.presence(partner),
+                subtitle: them == realName
+                    ? widget.presence(partner)
+                    : '$realName · ${widget.presence(partner)}',
+                onTap: () => _then(widget.onNickname),
+                trailingIcon: Icons.edit_outlined,
               ),
             ],
           ),
@@ -193,6 +232,12 @@ class _UsScreenState extends State<UsScreen> {
           _Group(
             children: [
               _Row(
+                leading: PersonAvatar(me, size: 36, photo: myPhoto),
+                title: 'Your photo',
+                subtitle: myPhoto == null ? 'Add a photo' : 'Change or remove',
+                onTap: () => _then(widget.onPhoto),
+              ),
+              _Row(
                 icon: Icons.badge_outlined,
                 title: 'Your name',
                 subtitle: me,
@@ -209,6 +254,12 @@ class _UsScreenState extends State<UsScreen> {
                 subtitle: 'Your connection and messages stay',
                 onTap: widget.onSignOut,
               ),
+            ],
+          ),
+          const _Heading('App'),
+          _Group(
+            children: [
+              _UpdateRow(updater: widget.updater, version: widget.version),
             ],
           ),
           const SizedBox(height: 26),
@@ -233,12 +284,6 @@ class _UsScreenState extends State<UsScreen> {
               textAlign: TextAlign.center,
               style: TextStyle(color: c.muted, fontSize: 12, height: 1.5),
             ),
-          ),
-          const SizedBox(height: 28),
-          Text(
-            widget.version,
-            textAlign: TextAlign.center,
-            style: TextStyle(color: c.muted, fontSize: 11),
           ),
         ],
       ),
@@ -281,12 +326,14 @@ class _Row extends StatelessWidget {
     this.leading,
     this.subtitle,
     this.onTap,
+    this.trailingIcon,
   });
   final String title;
   final IconData? icon;
   final Widget? leading;
   final String? subtitle;
   final VoidCallback? onTap;
+  final IconData? trailingIcon;
 
   @override
   Widget build(BuildContext context) {
@@ -307,7 +354,11 @@ class _Row extends StatelessWidget {
             ),
       trailing: onTap == null
           ? null
-          : Icon(Icons.chevron_right_rounded, color: c.muted, size: 20),
+          : Icon(
+              trailingIcon ?? Icons.chevron_right_rounded,
+              color: c.muted,
+              size: 20,
+            ),
     );
   }
 }
@@ -373,6 +424,232 @@ class _Swatch extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+enum _UpdateStage {
+  idle,
+  checking,
+  upToDate,
+  available,
+  downloading,
+  permission,
+  installing,
+  failed,
+}
+
+/// Settings row for updating Aida in place: check GitHub, download the APK,
+/// verify it, and open Android's installer, which asks to confirm.
+class _UpdateRow extends StatefulWidget {
+  const _UpdateRow({required this.updater, required this.version});
+  final AppUpdater? updater;
+  final String version;
+
+  @override
+  State<_UpdateRow> createState() => _UpdateRowState();
+}
+
+class _UpdateRowState extends State<_UpdateRow> {
+  _UpdateStage _stage = _UpdateStage.idle;
+  AppRelease? _release;
+  double _progress = 0;
+  String _problem = '';
+  File? _downloaded;
+
+  /// The installed version, read from Android; null until checked.
+  String? _current;
+
+  @override
+  void initState() {
+    super.initState();
+    // A quiet look when Us opens; problems only show after a tap.
+    if (widget.updater != null) _check(quiet: true);
+  }
+
+  Future<void> _check({bool quiet = false}) async {
+    final updater = widget.updater;
+    if (updater == null) return;
+    setState(() => _stage = _UpdateStage.checking);
+    try {
+      final current = await updater.currentVersion();
+      if (mounted) setState(() => _current = current);
+      final release = await updater.latest();
+      if (!mounted) return;
+      setState(() {
+        _release = release;
+        _stage = release != null && AppUpdater.isNewer(release.version, current)
+            ? _UpdateStage.available
+            : _UpdateStage.upToDate;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _stage = quiet ? _UpdateStage.idle : _UpdateStage.failed;
+        _problem = error is UpdateException
+            ? error.message
+            : 'Couldn’t check for updates. Check your connection.';
+      });
+    }
+  }
+
+  Future<void> _update() async {
+    final updater = widget.updater!;
+    final release = _release!;
+    try {
+      if (!await updater.canInstall()) {
+        setState(() => _stage = _UpdateStage.permission);
+        await updater.allowInstalls();
+        return;
+      }
+      setState(() {
+        _stage = _UpdateStage.downloading;
+        _progress = 0;
+      });
+      final file = await updater.download(
+        release,
+        await getTemporaryDirectory(),
+        onProgress: (fraction) {
+          if (mounted) setState(() => _progress = fraction);
+        },
+      );
+      if (!mounted) return;
+      _downloaded = file;
+      await _install();
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _stage = _UpdateStage.failed;
+        _problem = error is UpdateException
+            ? error.message
+            : 'The update didn’t finish. Try again.';
+      });
+    }
+  }
+
+  /// Opens Android's installer; if it was dismissed, this reopens it
+  /// without downloading again.
+  Future<void> _install() async {
+    setState(() => _stage = _UpdateStage.installing);
+    try {
+      await widget.updater!.install(_downloaded!);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _stage = _UpdateStage.failed;
+        _problem = 'Android couldn’t open the installer.';
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.aida;
+    final release = _release;
+    final megabytes = release == null
+        ? ''
+        : ' · ${(release.size / (1024 * 1024)).toStringAsFixed(0)} MB';
+    final (
+      String subtitle,
+      String? action,
+      VoidCallback? onAction,
+    ) = switch (_stage) {
+      _UpdateStage.idle => (
+        'Check for a newer version',
+        'Check',
+        () => _check(),
+      ),
+      _UpdateStage.checking => ('Checking…', null, null),
+      _UpdateStage.upToDate => (
+        'You have the latest version',
+        'Check',
+        () => _check(),
+      ),
+      _UpdateStage.available => (
+        'Version ${release!.version} is ready$megabytes',
+        'Update',
+        _update,
+      ),
+      _UpdateStage.downloading => (
+        'Downloading… ${(_progress * 100).round()}%',
+        null,
+        null,
+      ),
+      _UpdateStage.permission => (
+        'Allow “Install unknown apps” for Aida, then come back and tap Update.',
+        'Update',
+        _update,
+      ),
+      _UpdateStage.installing => (
+        'Confirm in the installer to finish updating.',
+        'Install',
+        _install,
+      ),
+      _UpdateStage.failed => (_problem, 'Try again', () => _check()),
+    };
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 12, 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Icon(
+                _stage == _UpdateStage.available
+                    ? Icons.system_update_rounded
+                    : Icons.verified_outlined,
+                color: c.accent,
+                size: 22,
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _current == null ? widget.version : 'Aida $_current',
+                      style: TextStyle(color: c.ink, fontSize: 15.5),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitle,
+                      style: TextStyle(
+                        color: _stage == _UpdateStage.failed
+                            ? c.danger
+                            : c.muted,
+                        fontSize: 12.5,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              if (_stage == _UpdateStage.checking)
+                const Padding(
+                  padding: EdgeInsets.all(12),
+                  child: SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                )
+              else if (action != null && widget.updater != null)
+                _stage == _UpdateStage.available
+                    ? FilledButton(
+                        onPressed: onAction,
+                        style: FilledButton.styleFrom(
+                          minimumSize: const Size(48, 40),
+                        ),
+                        child: Text(action),
+                      )
+                    : TextButton(onPressed: onAction, child: Text(action)),
+            ],
+          ),
+          if (_stage == _UpdateStage.downloading) ...[
+            const SizedBox(height: 10),
+            LinearProgressIndicator(value: _progress, minHeight: 3),
+          ],
+        ],
       ),
     );
   }

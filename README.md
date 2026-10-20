@@ -9,7 +9,23 @@ Aida lets each account have **one active partner**. Either person can disconnect
 - Backend integration tests for authentication, pairing races, media authorization/deletion, WebSocket delivery, and calls against local LiveKit.
 - AWS deployment: Node API, Caddy HTTPS, and self-hosted LiveKit on one Lightsail instance, with persistent chat storage and automatic certificate renewal.
 
-## Version 2.2 (current: 2.2.0, Android version code 5)
+## Version 2.3 (current: 2.3.0, Android version code 6)
+
+- **In-app updates:** Us → App checks the latest GitHub release of `ypatodkar/aida`, downloads its APK, verifies it against the published `.apk.sha256`, and opens Android's installer. Android asks to confirm every update, and the first time asks to allow "Install unknown apps" for Aida. It only accepts an APK signed with the same release key. 2.3.0 has to be installed by hand once; later versions can be installed from inside the app.
+- **Notifications** show every unread message in a topic (up to the last 12) as one conversation, with your partner's nickname and photo. A reply sent from the notification joins the same thread.
+- **Nicknames:** tap your partner in Us to choose what you call them. Only you see it, and it replaces their name at the top of the chat and in notifications.
+- **Profile photos:** Us → Your photo (gallery or camera, resized to 640 px, JPEG/PNG/WebP up to 5 MB). Only you and your partner can load it; it's stored under the server's data volume in `avatars/`.
+- **Back button:** on the chat, back first closes a reply or edit. Otherwise "Press back again to close Aida" shows, and a second press within two seconds closes the app.
+
+### Publishing an update
+
+1. Bump `version:` in `pubspec.yaml` (and `_version` in `lib/main.dart`), then build the signed APK as below.
+2. Copy it to `build/releases/aida-vX.Y.Z.apk` and write its checksum with `shasum -a 256 aida-vX.Y.Z.apk > aida-vX.Y.Z.apk.sha256`.
+3. `gh release create vX.Y.Z build/releases/aida-vX.Y.Z.apk build/releases/aida-vX.Y.Z.apk.sha256 --target main`
+
+The app compares the release tag with its own version. The repository must stay public for the app to see releases without a token.
+
+## Version 2.2 (2.2.0, Android version code 5)
 
 - Press and hold a message for quick reactions (❤️ 😂 😮 😢 👍 🔥), Reply, Copy, Keep in Moments, Save to your phone (photos and videos go to an "Aida" album), Share, and, for your own messages, Edit and Delete for both of you. Reactions notify the author; pushes still carry no message text.
 - Deleting removes the text or media file from the server and both phones and leaves a "deleted" placeholder. Edits are marked "edited". Kept messages appear in a Kept section in Moments.
@@ -44,9 +60,9 @@ Aida lets each account have **one active partner**. Either person can disconnect
 
 ### Install as an update
 
-Current signed APK: `build/releases/aida-v2.2.0.apk` (SHA-256 alongside it), also attached to the GitHub release `v2.2.0`.
+Current signed APK: `build/releases/aida-v2.3.0.apk` (SHA-256 alongside it), also attached to the GitHub release `v2.3.0`.
 
-The package remains `com.yashpatodkar.aida`, and the APK uses the same release signing key as version 1. Its version code is now 5, greater than all previous builds (1–4). **Install the new APK over the old app; do not uninstall, clear storage, or tap Disconnect.** Android preserves the existing secure-storage session and settings, and AWS preserves your pairing and conversation. An expired sign-in session can require signing in again with the same Google account; this does not end the server-side connection.
+The package remains `com.yashpatodkar.aida`, and the APK uses the same release signing key as version 1. Its version code is now 6, greater than all previous builds (1–5). **Install the new APK over the old app; do not uninstall, clear storage, or tap Disconnect.** Android preserves the existing secure-storage session and settings, and AWS preserves your pairing and conversation. An expired sign-in session can require signing in again with the same Google account; this does not end the server-side connection.
 
 ### Enable background notifications
 

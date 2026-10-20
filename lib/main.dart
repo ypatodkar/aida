@@ -21,6 +21,7 @@ import 'media_view.dart';
 import 'design.dart';
 import 'moments_screen.dart';
 import 'notifications.dart';
+import 'updates.dart';
 import 'us_screen.dart';
 
 void main() => runApp(const AidaApp());
@@ -43,7 +44,7 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
   );
   static const _preview =
       kDebugMode && bool.fromEnvironment('AIDA_DESIGN_PREVIEW');
-  static const _version = 'Aida 2.2.0';
+  static const _version = 'Aida 2.3.0';
 
   final _nameController = TextEditingController();
   final _inviteController = TextEditingController();
@@ -215,6 +216,14 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
       setState(() => _loading = false);
       return;
     }
+    // A finished update leaves its APK behind; it's only needed until then.
+    unawaited(
+      getTemporaryDirectory()
+          .then(
+            (dir) => Directory('${dir.path}/updates').delete(recursive: true),
+          )
+          .catchError((_) => Directory('')),
+    );
     await _notifications.initialize();
     _notifications.onTap = _handleNotice;
     _notifications.showInForeground = (data) => foregroundPushShouldNotify(
@@ -424,35 +433,40 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
     await _loadMessages();
   }
 
+  /// A one-field dialog; resolves to the trimmed text, or null if cancelled.
+  Future<String?> _prompt({
+    required String title,
+    required String confirm,
+    String? label,
+    String? hint,
+    String? helper,
+    String initial = '',
+    int? maxLength,
+    TextInputType? keyboard,
+    bool sentences = true,
+  }) => showDialog<String>(
+    context: _navigatorKey.currentContext!,
+    builder: (_) => _PromptDialog(
+      title: title,
+      confirm: confirm,
+      label: label,
+      hint: hint,
+      helper: helper,
+      initial: initial,
+      maxLength: maxLength,
+      keyboard: keyboard,
+      sentences: sentences,
+    ),
+  );
+
   Future<void> _createTopic() async {
-    final controller = TextEditingController();
-    final name = await showDialog<String>(
-      context: _navigatorKey.currentContext!,
-      builder: (context) => AlertDialog(
-        title: const Text('A space for something'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          maxLength: 32,
-          textCapitalization: TextCapitalization.sentences,
-          decoration: const InputDecoration(
-            labelText: 'Topic name',
-            hintText: 'Trip to Italy, Movie nights…',
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, controller.text.trim()),
-            child: const Text('Create topic'),
-          ),
-        ],
-      ),
+    final name = await _prompt(
+      title: 'A space for something',
+      label: 'Topic name',
+      hint: 'Trip to Italy, Movie nights…',
+      maxLength: 32,
+      confirm: 'Create topic',
     );
-    controller.dispose();
     if (name == null || name.isEmpty || _loadedPairId == null) return;
     await _run(() async {
       final topic = await _api!.createTopic(name, _loadedPairId!);
@@ -777,34 +791,15 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
   }
 
   Future<void> _serverSettings() async {
-    final controller = TextEditingController(
-      text: _api?.baseUrl ?? _defaultUrl,
+    final result = await _prompt(
+      title: 'Server address',
+      label: 'API URL',
+      hint: 'https://chat.example.com',
+      initial: _api?.baseUrl ?? _defaultUrl,
+      keyboard: TextInputType.url,
+      sentences: false,
+      confirm: 'Save',
     );
-    final result = await showDialog<String>(
-      context: _navigatorKey.currentContext!,
-      builder: (context) => AlertDialog(
-        title: const Text('Server address'),
-        content: TextField(
-          controller: controller,
-          keyboardType: TextInputType.url,
-          decoration: const InputDecoration(
-            labelText: 'API URL',
-            hintText: 'https://chat.example.com',
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, controller.text.trim()),
-            child: const Text('Save'),
-          ),
-        ],
-      ),
-    );
-    controller.dispose();
     if (result == null) return;
     final uri = Uri.tryParse(result);
     if (uri == null ||
@@ -936,6 +931,115 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
     await _run(() async {
       await _api!.setName(name);
       await _refresh();
+    });
+  }
+
+  Future<void> _changeNickname() async {
+    final partner =
+        (_state?['pair'] as Map?)?['partner'] as Map<String, dynamic>?;
+    if (partner == null) return;
+    final nickname = await _prompt(
+      title: 'What do you call ${partner['name']}?',
+      hint: partner['name'] as String,
+      helper: 'Only you see this. Leave it empty to use their name.',
+      initial: partner['nickname'] as String? ?? '',
+      maxLength: 40,
+      confirm: 'Save',
+    );
+    if (nickname == null) return;
+    await _run(() async {
+      if (_preview) {
+        setState(
+          () => partner['nickname'] = nickname.isEmpty ? null : nickname,
+        );
+        return;
+      }
+      final state = await _api!.setNickname(nickname);
+      if (mounted) setState(() => _state = state);
+    });
+  }
+
+  Future<void> _changePhoto() async {
+    final user = _state?['user'] as Map<String, dynamic>?;
+    if (user == null) return;
+    final hasPhoto = user['photoAt'] != null;
+    final choice = await showModalBottomSheet<String>(
+      context: _navigatorKey.currentContext!,
+      builder: (context) {
+        final c = context.aida;
+        Widget option(
+          IconData icon,
+          String label,
+          String value, {
+          Color? color,
+        }) => ListTile(
+          leading: Icon(icon, color: color ?? c.accent),
+          title: Text(label, style: TextStyle(color: color ?? c.ink)),
+          onTap: () => Navigator.pop(context, value),
+        );
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(24, 0, 24, 4),
+                child: Text(
+                  'Your photo',
+                  style: TextStyle(
+                    fontFamily: serif,
+                    fontSize: 28,
+                    color: c.ink,
+                  ),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(24, 0, 24, 8),
+                child: Text(
+                  'Only you and your partner can see it.',
+                  style: TextStyle(color: c.muted, fontSize: 13),
+                ),
+              ),
+              option(
+                Icons.photo_library_outlined,
+                'Choose from gallery',
+                'gallery',
+              ),
+              option(Icons.photo_camera_outlined, 'Take a photo', 'camera'),
+              if (hasPhoto)
+                option(
+                  Icons.delete_outline_rounded,
+                  'Remove photo',
+                  'remove',
+                  color: c.danger,
+                ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
+    );
+    if (choice == null || _preview) return;
+    await _run(() async {
+      if (choice == 'remove') {
+        final state = await _api!.deletePhoto();
+        if (mounted) setState(() => _state = state);
+        return;
+      }
+      final picked = await _picker.pickImage(
+        source: choice == 'camera' ? ImageSource.camera : ImageSource.gallery,
+        preferredCameraDevice: CameraDevice.front,
+        maxWidth: 640,
+        maxHeight: 640,
+        imageQuality: 85,
+      );
+      if (picked == null) return;
+      var mime = _mimeOf(picked);
+      if (!['image/jpeg', 'image/png', 'image/webp'].contains(mime)) {
+        mime = 'image/jpeg';
+      }
+      final state = await _api!.setPhoto(File(picked.path), mime);
+      if (mounted) setState(() => _state = state);
     });
   }
 
@@ -1212,10 +1316,12 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
             api: _api!,
             call: call,
             myId: (_state!['user'] as Map)['id'] as String,
-            partnerName:
-                ((_state!['pair'] as Map<String, dynamic>)['partner']
-                        as Map<String, dynamic>)['name']
-                    as String,
+            partnerName: _partnerLabel(
+              (_state!['pair'] as Map)['partner'] as Map<String, dynamic>,
+            ),
+            partnerPhoto: _photoOf(
+              (_state!['pair'] as Map)['partner'] as Map<String, dynamic>,
+            ),
           ),
         ),
       );
@@ -1253,7 +1359,9 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
               since: pair['createdAt'] as int?,
               myId: _myId,
               myName: (_state!['user'] as Map)['name']?.toString() ?? '',
-              partnerName: (pair['partner'] as Map)['name']?.toString() ?? '',
+              partnerName: _partnerLabel(
+                pair['partner'] as Map<String, dynamic>,
+              ),
               preview: _preview ? _previewMedia : null,
               previewKept: _preview
                   ? _messages.where((m) => m['kept'] == true).toList()
@@ -1282,6 +1390,11 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
               onSignOut: _signOut,
               onDisconnect: _disconnect,
               version: _version,
+              partnerLabel: _partnerLabel,
+              photoOf: _photoOf,
+              onNickname: _changeNickname,
+              onPhoto: _changePhoto,
+              updater: _preview ? null : AppUpdater(),
             ),
           ),
         )
@@ -1317,7 +1430,13 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
             ? _connectionScreen(context)
             : _state?['pair'] == null
             ? _unpairedScreen(context)
-            : _chatScreen(context),
+            : PopScope(
+                canPop: false,
+                onPopInvokedWithResult: (didPop, _) {
+                  if (!didPop) _handleBack();
+                },
+                child: _chatScreen(context),
+              ),
       ),
     );
   }
@@ -1471,7 +1590,11 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
               const SizedBox(height: 16),
               Align(
                 alignment: Alignment.centerLeft,
-                child: PersonAvatar(user['name']?.toString() ?? 'A', size: 64),
+                child: PersonAvatar(
+                  user['name']?.toString() ?? 'A',
+                  size: 64,
+                  photo: _photoOf(user),
+                ),
               ),
               const SizedBox(height: 24),
               Text(
@@ -1686,6 +1809,7 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
     final partner = pair['partner'] as Map<String, dynamic>;
     final user = _state!['user'] as Map<String, dynamic>;
     final online = _liveReady && partner['online'] == true;
+    final partnerName = _partnerLabel(partner);
     final topicName =
         _topics.firstWhere(
               (t) => t['id'] == _topicId,
@@ -1708,7 +1832,11 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
                   Stack(
                     clipBehavior: Clip.none,
                     children: [
-                      PersonAvatar(partner['name'] as String, size: 42),
+                      PersonAvatar(
+                        partnerName,
+                        size: 42,
+                        photo: _photoOf(partner),
+                      ),
                       Positioned(
                         right: -1,
                         bottom: -1,
@@ -1736,7 +1864,7 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         Text(
-                          partner['name'] as String,
+                          partnerName,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(
@@ -1850,11 +1978,7 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
           Expanded(
             child: _messages.isEmpty
                 ? _emptyChat(c, topicName)
-                : _messageList(
-                    c,
-                    user['id'] as String,
-                    partner['name'] as String,
-                  ),
+                : _messageList(c, user['id'] as String, partnerName),
           ),
           AnimatedSize(
             duration: const Duration(milliseconds: 220),
@@ -1865,17 +1989,12 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
                     alignment: Alignment.centerLeft,
                     child: Padding(
                       padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-                      child: TypingBubble(name: partner['name'] as String),
+                      child: TypingBubble(name: partnerName),
                     ),
                   )
                 : const SizedBox(width: double.infinity),
           ),
-          _composer(
-            c,
-            topicName,
-            user['id'] as String,
-            partner['name'] as String,
-          ),
+          _composer(c, topicName, user['id'] as String, partnerName),
         ],
       ),
     );
@@ -2007,6 +2126,53 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
   }
 
   String get _myId => (_state!['user'] as Map)['id'] as String;
+
+  /// What you call your partner: your private nickname, or their name.
+  static String _partnerLabel(Map<String, dynamic> partner) {
+    final nickname = (partner['nickname'] as String?)?.trim() ?? '';
+    return nickname.isEmpty ? partner['name'] as String : nickname;
+  }
+
+  ImageProvider? _photoOf(Map<String, dynamic>? person) {
+    final version = person?['photoAt'] as int?;
+    if (person == null || version == null || _api == null || _preview) {
+      return null;
+    }
+    return NetworkImage(
+      _api!.userPhotoUrl(person['id'] as String, version).toString(),
+      headers: _api!.mediaHeaders,
+    );
+  }
+
+  /// Back on the chat closes a reply or edit first, then needs a second
+  /// press within two seconds to leave, so a stray swipe doesn't close Aida.
+  DateTime? _lastBack;
+
+  void _handleBack() {
+    if (_editing != null) {
+      _cancelEdit();
+      return;
+    }
+    if (_replyTo != null) {
+      setState(() => _replyTo = null);
+      return;
+    }
+    final now = DateTime.now();
+    if (_lastBack != null &&
+        now.difference(_lastBack!) < const Duration(seconds: 2)) {
+      SystemNavigator.pop();
+      return;
+    }
+    _lastBack = now;
+    _messengerKey.currentState
+      ?..hideCurrentSnackBar()
+      ..showSnackBar(
+        const SnackBar(
+          content: Text('Press back again to close Aida'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+  }
 
   /// Applies the change on screen at once; the server's copy replaces it, or
   /// the original comes back if the request fails.
@@ -2919,5 +3085,73 @@ class _CameraButton extends StatelessWidget {
       radius: 22,
       child: Icon(Icons.photo_camera_outlined, color: color, size: 22),
     ),
+  );
+}
+
+/// Owns its text controller, so the field stays valid while the dialog
+/// animates closed.
+class _PromptDialog extends StatefulWidget {
+  const _PromptDialog({
+    required this.title,
+    required this.confirm,
+    required this.initial,
+    required this.sentences,
+    this.label,
+    this.hint,
+    this.helper,
+    this.maxLength,
+    this.keyboard,
+  });
+  final String title;
+  final String confirm;
+  final String initial;
+  final bool sentences;
+  final String? label;
+  final String? hint;
+  final String? helper;
+  final int? maxLength;
+  final TextInputType? keyboard;
+
+  @override
+  State<_PromptDialog> createState() => _PromptDialogState();
+}
+
+class _PromptDialogState extends State<_PromptDialog> {
+  late final _controller = TextEditingController(text: widget.initial);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: Text(widget.title),
+    content: TextField(
+      controller: _controller,
+      autofocus: true,
+      maxLength: widget.maxLength,
+      keyboardType: widget.keyboard,
+      textCapitalization: widget.sentences
+          ? TextCapitalization.sentences
+          : TextCapitalization.none,
+      decoration: InputDecoration(
+        labelText: widget.label,
+        hintText: widget.hint,
+        helperText: widget.helper,
+        helperMaxLines: 2,
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('Cancel'),
+      ),
+      FilledButton(
+        onPressed: () => Navigator.pop(context, _controller.text.trim()),
+        child: Text(widget.confirm),
+      ),
+    ],
   );
 }

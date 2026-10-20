@@ -14,6 +14,8 @@
     <!-- Saving photos and videos to the gallery; only needed up to Android 10. -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="29" />
+    <!-- In-app updates hand the downloaded APK to Android's installer. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <application
         android:allowBackup="false"
@@ -27,6 +29,13 @@
             android:name="com.dexterous.flutterlocalnotifications.ActionBroadcastReceiver" />
         <service android:name=".CallForegroundService" android:exported="false"
             android:foregroundServiceType="camera|microphone" />
+        <provider android:name=".UpdateFileProvider"
+            android:authorities="${applicationId}.updates"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/update_paths" />
+        </provider>
         <activity
             android:name=".MainActivity"
             android:exported="true"

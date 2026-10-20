@@ -104,6 +104,18 @@ Future<void> performNotificationAction(NotificationResponse response) async {
         topicId: data['topicId'] as String,
         pairId: data['pairId'] as String,
       );
+      try {
+        await showConversation(
+          api,
+          state,
+          data['pairId'] as String,
+          data['topicId'] as String,
+          alert: false,
+        );
+        return;
+      } catch (_) {
+        // Fall back to a simple confirmation below.
+      }
       await _notices.show(
         id: id,
         title: 'Reply sent',
@@ -156,6 +168,117 @@ Future<void> performNotificationAction(NotificationResponse response) async {
   } finally {
     api.close();
   }
+}
+
+String _line(Map<String, dynamic> message) => switch (message['kind']) {
+  'image' => '📷 Photo',
+  'video' => '🎥 Video',
+  _ => message['text'] as String? ?? '',
+};
+
+/// Renders run one at a time, so a slow render can't overwrite a newer one.
+Future<void> _renders = Future.value();
+
+/// Shows every unread message in a topic as one conversation notification,
+/// with replies sent from the notification included. [alert] is false when
+/// refreshing after your own reply, so the update arrives silently.
+Future<void> showConversation(
+  AidaApi api,
+  Map<String, dynamic> state,
+  String pairId,
+  String topicId, {
+  required bool alert,
+}) {
+  final render = _renders.then(
+    (_) => _renderConversation(api, state, pairId, topicId, alert: alert),
+  );
+  _renders = render.catchError((_) {});
+  return render;
+}
+
+Future<void> _renderConversation(
+  AidaApi api,
+  Map<String, dynamic> state,
+  String pairId,
+  String topicId, {
+  required bool alert,
+}) async {
+  final id = topicNoticeId(pairId, topicId);
+  final unread = await api.unread(topicId);
+  final messages = (unread['messages'] as List).cast<Map<String, dynamic>>();
+  final myId = (state['user'] as Map)['id'];
+  if (!messages.any((m) => m['senderId'] != myId)) {
+    await _notices.cancel(id: id);
+    return;
+  }
+  final partner = (state['pair'] as Map)['partner'] as Map<String, dynamic>;
+  final partnerName = unread['partnerName'] as String;
+  final topicName = unread['topicName'] as String;
+  Uint8List? photo;
+  final photoAt = partner['photoAt'] as int?;
+  if (photoAt != null) {
+    try {
+      final bytes = await api.photoBytes(partner['id'] as String, photoAt);
+      if (bytes != null) photo = Uint8List.fromList(bytes);
+    } catch (_) {
+      // The initial-less default icon is fine when the photo can't load.
+    }
+  }
+  final them = Person(
+    key: partner['id'] as String,
+    name: partnerName,
+    important: true,
+    icon: photo == null ? null : ByteArrayAndroidIcon(photo),
+  );
+  final named = topicId != 'general';
+  await _notices.show(
+    id: id,
+    title: named ? '$partnerName · $topicName' : partnerName,
+    body: _line(messages.last),
+    payload: jsonEncode({
+      'type': 'message',
+      'pairId': pairId,
+      'topicId': topicId,
+    }),
+    notificationDetails: NotificationDetails(
+      android: AndroidNotificationDetails(
+        'aida_messages_v2',
+        'Messages',
+        importance: Importance.high,
+        priority: Priority.high,
+        color: const Color(0xFF6B5BA5),
+        visibility: NotificationVisibility.private,
+        category: AndroidNotificationCategory.message,
+        silent: !alert,
+        largeIcon: photo == null ? null : ByteArrayAndroidBitmap(photo),
+        number: unread['unreadCount'] as int?,
+        styleInformation: MessagingStyleInformation(
+          const Person(name: 'You'),
+          conversationTitle: named ? topicName : null,
+          groupConversation: named,
+          messages: [
+            for (final message in messages)
+              Message(
+                _line(message),
+                DateTime.fromMillisecondsSinceEpoch(
+                  message['createdAt'] as int,
+                ),
+                message['senderId'] == myId ? null : them,
+              ),
+          ],
+        ),
+        actions: const [
+          AndroidNotificationAction(
+            'reply',
+            'Reply',
+            semanticAction: SemanticAction.reply,
+            cancelNotification: false,
+            inputs: [AndroidNotificationActionInput(label: 'Your reply')],
+          ),
+        ],
+      ),
+    ),
+  );
 }
 
 Future<void> showRemoteEvent(Map<String, dynamic> data) async {
@@ -234,42 +357,12 @@ Future<void> showRemoteEvent(Map<String, dynamic> data) async {
       final seenKey = 'notice_${data['pairId']}_$topicId';
       final last = int.tryParse(await _storage.read(key: seenKey) ?? '') ?? 0;
       if ((item['id'] as int) <= last) return;
-      final preview = item['kind'] == 'text'
-          ? item['text'] as String
-          : item['kind'] == 'image'
-          ? 'Sent a photo'
-          : 'Sent a video';
-      final payload = jsonEncode({
-        'type': 'message',
-        'pairId': data['pairId'],
-        'topicId': topicId,
-      });
-      await _notices.show(
-        id: topicNoticeId(data['pairId'] as String, topicId),
-        title: '${item['senderName']} · ${item['topicName']}',
-        body: preview,
-        payload: payload,
-        notificationDetails: NotificationDetails(
-          android: AndroidNotificationDetails(
-            'aida_messages_v2',
-            'Messages',
-            importance: Importance.high,
-            priority: Priority.high,
-            color: const Color(0xFF6B5BA5),
-            visibility: NotificationVisibility.private,
-            category: AndroidNotificationCategory.message,
-            styleInformation: BigTextStyleInformation(preview),
-            actions: const [
-              AndroidNotificationAction(
-                'reply',
-                'Reply',
-                semanticAction: SemanticAction.reply,
-                cancelNotification: false,
-                inputs: [AndroidNotificationActionInput(label: 'Your reply')],
-              ),
-            ],
-          ),
-        ),
+      await showConversation(
+        api,
+        state,
+        data['pairId'] as String,
+        topicId,
+        alert: true,
       );
       await _storage.write(key: seenKey, value: item['id'].toString());
     } else if (data['type'] == 'call' || data['type'] == 'call_changed') {

@@ -12,7 +12,8 @@ test('v1 database upgrades twice without losing users, pairing, sessions, or mes
   try {
     db = openDatabase(path);
     // Strip everything added after v1 so the file matches a real v1 database.
-    db.exec(`DROP INDEX messages_by_change; DROP TABLE reactions; DROP TABLE kept;
+    db.exec(`DROP TABLE nicknames; ALTER TABLE users DROP COLUMN photo_at; ALTER TABLE users DROP COLUMN photo_mime;
+      DROP INDEX messages_by_change; DROP TABLE reactions; DROP TABLE kept;
       ALTER TABLE messages DROP COLUMN reply_to_id; ALTER TABLE messages DROP COLUMN updated_seq;
       ALTER TABLE messages DROP COLUMN edited_at; ALTER TABLE messages DROP COLUMN deleted_at;
       DROP INDEX messages_by_topic; ALTER TABLE messages DROP COLUMN topic_id;
@@ -37,6 +38,8 @@ test('v1 database upgrades twice without losing users, pairing, sessions, or mes
       assert.equal(message.deleted_at, null);
       assert.equal(db.prepare('SELECT COUNT(*) AS n FROM reactions').get().n, 0);
       assert.equal(db.prepare('SELECT COUNT(*) AS n FROM kept').get().n, 0);
+      assert.equal(db.prepare('SELECT COUNT(*) AS n FROM nicknames').get().n, 0);
+      assert.equal(db.prepare('SELECT photo_at FROM users WHERE id = ?').get('a').photo_at, null);
       assert.equal(db.prepare('SELECT last_seen_at FROM users LIMIT 1').get().last_seen_at, null);
       assert.equal(db.prepare('SELECT COUNT(*) AS n FROM receipts').get().n, 0);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);

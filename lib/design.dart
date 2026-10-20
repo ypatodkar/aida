@@ -376,13 +376,46 @@ class _AidaMarkState extends State<AidaMark>
 }
 
 class PersonAvatar extends StatelessWidget {
-  const PersonAvatar(this.name, {super.key, this.size = 44, this.dark = false});
+  const PersonAvatar(
+    this.name, {
+    super.key,
+    this.size = 44,
+    this.dark = false,
+    this.photo,
+  });
   final String name;
   final double size;
   final bool dark;
+
+  /// Their profile photo, if they added one; the initial shows otherwise.
+  final ImageProvider? photo;
   @override
   Widget build(BuildContext context) {
     final c = context.aida;
+    final initial = _initial(c);
+    if (photo == null) return initial;
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        border: Border.all(
+          color: dark ? Colors.white12 : c.background,
+          width: 2,
+        ),
+      ),
+      child: ClipOval(
+        child: Image(
+          image: photo!,
+          fit: BoxFit.cover,
+          gaplessPlayback: true,
+          errorBuilder: (_, _, _) => initial,
+        ),
+      ),
+    );
+  }
+
+  Widget _initial(AidaColors c) {
     return Container(
       width: size,
       height: size,
@@ -410,18 +443,30 @@ class PersonAvatar extends StatelessWidget {
 
 /// Both people, overlapping slightly.
 class CoupleAvatars extends StatelessWidget {
-  const CoupleAvatars(this.me, this.partner, {super.key, this.size = 64});
+  const CoupleAvatars(
+    this.me,
+    this.partner, {
+    super.key,
+    this.size = 64,
+    this.mePhoto,
+    this.partnerPhoto,
+  });
   final String me;
   final String partner;
   final double size;
+  final ImageProvider? mePhoto;
+  final ImageProvider? partnerPhoto;
   @override
   Widget build(BuildContext context) => SizedBox(
     width: size * 1.72,
     height: size,
     child: Stack(
       children: [
-        PersonAvatar(partner, size: size),
-        Positioned(right: 0, child: PersonAvatar(me, size: size)),
+        PersonAvatar(partner, size: size, photo: partnerPhoto),
+        Positioned(
+          right: 0,
+          child: PersonAvatar(me, size: size, photo: mePhoto),
+        ),
       ],
     ),
   );

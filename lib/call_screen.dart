@@ -13,11 +13,13 @@ class CallScreen extends StatefulWidget {
     required this.api,
     required this.call,
     required this.partnerName,
+    this.partnerPhoto,
     required this.myId,
   });
   final AidaApi api;
   final Map<String, dynamic> call;
   final String partnerName;
+  final ImageProvider? partnerPhoto;
   final String myId;
   @override
   State<CallScreen> createState() => _CallScreenState();
@@ -350,6 +352,7 @@ class _CallScreenState extends State<CallScreen> {
                                     children: [
                                       PersonAvatar(
                                         widget.partnerName,
+                                        photo: widget.partnerPhoto,
                                         size: 108,
                                         dark: true,
                                       ),

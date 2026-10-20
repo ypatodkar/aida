@@ -152,7 +152,21 @@ export function openDatabase(path) {
       created_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS kept_by_pair ON kept(pair_id, created_at);
+    CREATE TABLE IF NOT EXISTS nicknames (
+      pair_id TEXT NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL REFERENCES users(id),
+      nickname TEXT NOT NULL,
+      PRIMARY KEY (pair_id, user_id)
+    );
   `);
+  // Additive migration: an optional profile photo per person.
+  const userColumns = db.prepare('PRAGMA table_info(users)').all();
+  if (!userColumns.some(column => column.name === 'photo_at')) {
+    db.exec('ALTER TABLE users ADD COLUMN photo_at INTEGER');
+  }
+  if (!userColumns.some(column => column.name === 'photo_mime')) {
+    db.exec('ALTER TABLE users ADD COLUMN photo_mime TEXT');
+  }
   return db;
 }
 

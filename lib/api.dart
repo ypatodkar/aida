@@ -216,6 +216,47 @@ class AidaApi {
     return response.headers['content-type'] ?? 'application/octet-stream';
   }
 
+  /// What you call your partner; an empty string clears it.
+  Future<Map<String, dynamic>> setNickname(String nickname) =>
+      _request('PUT', '/v1/pair/nickname', body: {'nickname': nickname});
+
+  Future<Map<String, dynamic>> setPhoto(File file, String mime) async {
+    final request = http.Request('PUT', _uri('/v1/me/photo'))
+      ..headers['content-type'] = mime
+      ..headers['authorization'] = 'Bearer $token'
+      ..bodyBytes = await file.readAsBytes();
+    final response = await http.Response.fromStream(
+      await _client.send(request).timeout(const Duration(seconds: 30)),
+    );
+    final value = jsonDecode(response.body) as Map<String, dynamic>;
+    if (response.statusCode != 200) {
+      throw ApiException(
+        value['message']?.toString() ?? 'Photo upload failed',
+        response.statusCode,
+      );
+    }
+    return value;
+  }
+
+  Future<Map<String, dynamic>> deletePhoto() =>
+      _request('DELETE', '/v1/me/photo');
+
+  /// [version] is the photo's `photoAt`, so a new photo is never served from
+  /// the image cache.
+  Uri userPhotoUrl(String userId, int version) =>
+      _uri('/v1/users/$userId/photo?v=$version');
+
+  /// Messages after your read point in [topicId], for notifications.
+  Future<Map<String, dynamic>> unread(String topicId) =>
+      _request('GET', '/v1/unread?topicId=${Uri.encodeComponent(topicId)}');
+
+  Future<List<int>?> photoBytes(String userId, int version) async {
+    final response = await _client
+        .get(userPhotoUrl(userId, version), headers: mediaHeaders)
+        .timeout(const Duration(seconds: 10));
+    return response.statusCode == 200 ? response.bodyBytes : null;
+  }
+
   Uri mediaUrl(String id) => _uri('/v1/media/$id');
 
   Map<String, String> get mediaHeaders => {'authorization': 'Bearer $token'};

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:aida/main.dart';
 import 'package:aida/media_view.dart';
@@ -320,5 +321,65 @@ void main() {
     await tester.enterText(find.byType(TextField), 'Hello');
     await tester.pump();
     expect(find.bySemanticsLabel('Take a photo'), findsNothing);
+  }, skip: _skip);
+
+  testWidgets('back asks for a second press before closing Aida', (
+    tester,
+  ) async {
+    final calls = <String>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        calls.add(call.method);
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
+    await _phone(tester);
+    await tester.pumpAndSettle();
+
+    // Back first closes a reply in progress.
+    await holdMessage(tester, 'Saving you a seat for when you get here.');
+    await tester.tap(find.text('Reply'));
+    await tester.pumpAndSettle();
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+    expect(find.text('Replying to Sofia'), findsNothing);
+    expect(find.text('Press back again to close Aida'), findsNothing);
+
+    await tester.binding.handlePopRoute();
+    await tester.pump();
+    expect(find.text('Press back again to close Aida'), findsOneWidget);
+    expect(calls, isNot(contains('SystemNavigator.pop')));
+    await tester.binding.handlePopRoute();
+    await tester.pump();
+    expect(calls, contains('SystemNavigator.pop'));
+  }, skip: _skip);
+
+  testWidgets('a private nickname replaces their name at the top', (
+    tester,
+  ) async {
+    await _phone(tester);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Sofia'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Sofia').last);
+    await tester.pumpAndSettle();
+    expect(find.text('What do you call Sofia?'), findsOneWidget);
+    await tester.enterText(find.byType(TextField), 'Love');
+    await tester.tap(find.text('Save'));
+    await tester.pumpAndSettle();
+    expect(find.text('Yash & Love'), findsOneWidget);
+    expect(find.textContaining('Sofia ·'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('Back to chat'));
+    await tester.pumpAndSettle();
+    expect(find.text('Love'), findsOneWidget);
+    expect(find.text('Sofia'), findsNothing);
   }, skip: _skip);
 }
