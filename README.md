@@ -9,7 +9,11 @@ Aida lets each account have **one active partner**. Either person can disconnect
 - Backend integration tests for authentication, pairing races, media authorization/deletion, WebSocket delivery, and calls against local LiveKit.
 - AWS deployment: Node API, Caddy HTTPS, and self-hosted LiveKit on one Lightsail instance, with persistent chat storage and automatic certificate renewal.
 
-## Version 2.3 (current: 2.3.0, Android version code 6)
+## Version 2.3.1 (current: 2.3.1, Android version code 7)
+
+- **Last seen** now only reflects time with Aida open. The server records it on each foreground heartbeat and at the moment the app closes; a background connection, a reconnect, or a server restart never changes it, and a phone that vanishes without closing keeps its last heartbeat. The app shows it as a clock time ("Last seen today at 14:05").
+
+## Version 2.3 (2.3.0, Android version code 6)
 
 - **In-app updates:** Us → App checks the latest GitHub release of `ypatodkar/aida`, downloads its APK, verifies it against the published `.apk.sha256`, and opens Android's installer. Android asks to confirm every update, and the first time asks to allow "Install unknown apps" for Aida. It only accepts an APK signed with the same release key. 2.3.0 has to be installed by hand once; later versions can be installed from inside the app.
 - **Notifications** show every unread message in a topic (up to the last 12) as one conversation, with your partner's nickname and photo. A reply sent from the notification joins the same thread.
@@ -60,9 +64,9 @@ The app compares the release tag with its own version. The repository must stay 
 
 ### Install as an update
 
-Current signed APK: `build/releases/aida-v2.3.0.apk` (SHA-256 alongside it), also attached to the GitHub release `v2.3.0`.
+Current signed APK: `build/releases/aida-v2.3.1.apk` (SHA-256 alongside it), also attached to the GitHub release `v2.3.1`.
 
-The package remains `com.yashpatodkar.aida`, and the APK uses the same release signing key as version 1. Its version code is now 6, greater than all previous builds (1–5). **Install the new APK over the old app; do not uninstall, clear storage, or tap Disconnect.** Android preserves the existing secure-storage session and settings, and AWS preserves your pairing and conversation. An expired sign-in session can require signing in again with the same Google account; this does not end the server-side connection.
+The package remains `com.yashpatodkar.aida`, and the APK uses the same release signing key as version 1. Its version code is now 7, greater than all previous builds (1–6). **Install the new APK over the old app; do not uninstall, clear storage, or tap Disconnect.** Android preserves the existing secure-storage session and settings, and AWS preserves your pairing and conversation. An expired sign-in session can require signing in again with the same Google account; this does not end the server-side connection.
 
 ### Enable background notifications
 

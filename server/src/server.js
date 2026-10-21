@@ -184,16 +184,22 @@ export function createApp(options = {}) {
     };
   }
 
+  /** Records that this person had the app open at [time]. */
+  function markSeen(userId, time) {
+    db.prepare('UPDATE users SET last_seen_at = ? WHERE id = ?').run(time, userId);
+  }
+
   function publishPresence(userId) {
     const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
     if (!user) return;
     const status = presence(user);
-    if (presenceStates.get(userId) === status.online) return;
+    const previous = presenceStates.get(userId);
+    if (previous === status.online) return;
     presenceStates.set(userId, status.online);
-    if (!status.online) {
-      status.lastSeenAt = now();
-      db.prepare('UPDATE users SET last_seen_at = ? WHERE id = ?').run(status.lastSeenAt, userId);
-    }
+    // A connection from an app that hasn't been opened (running in the
+    // background, reconnecting, or after a server restart) is not news, and
+    // last seen is only ever set by markSeen while the app is open.
+    if (previous === undefined && !status.online) return;
     if (user.pair_id) {
       const pair = currentPair(user);
       notify([otherId(pair, userId)], 'presence', { pairId: pair.id, userId, ...status });
@@ -1071,9 +1077,11 @@ export function createApp(options = {}) {
             if (stamp - (ws.windowStart ?? 0) > 1000) { ws.windowStart = stamp; ws.eventCount = 0; }
             if (++ws.eventCount > 20) { ws.close(1008, 'Too many events'); return; }
             if (event.type === 'presence' && typeof event.active === 'boolean') {
+              const wasOpen = ws.activeUntil > stamp;
               ws.activeUntil = event.active ? stamp + presenceTtl : 0;
-              if (event.active) db.prepare('UPDATE users SET last_seen_at = ? WHERE id = ?').run(stamp, user.id);
-              else stopTyping(ws, user.id);
+              // Every foreground heartbeat, and the moment the app is closed.
+              if (event.active || wasOpen) markSeen(user.id, stamp);
+              if (!event.active) stopTyping(ws, user.id);
               publishPresence(user.id);
             } else if (event.type === 'typing' && typeof event.typing === 'boolean') {
               const pair = currentPair(freshUser);
@@ -1091,6 +1099,9 @@ export function createApp(options = {}) {
           }
         });
         ws.on('close', () => {
+          // Lost while the app was open: they were here until now. (During
+          // shutdown the last heartbeat stands.)
+          if (!closing && ws.activeUntil > now()) markSeen(user.id, now());
           set.delete(ws);
           if (set.size === 0) clients.delete(user.id);
           if (!closing) {

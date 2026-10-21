@@ -606,3 +606,62 @@ test('private nicknames, profile photos, and unread history for notifications', 
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM nicknames').get().n, 0);
   db.close();
 });
+
+test('last seen is the last time the app was open, never a background connection', async t => {
+  const f = await fixture(t, { presenceTtl: 600, activityInterval: 20 });
+  const a = await f.login('seen-a@example.com');
+  const b = await f.login('seen-b@example.com');
+  const invite = (await f.request('/v1/invites', { method: 'POST', token: a })).value;
+  await f.request('/v1/invites/accept', { method: 'POST', token: b, body: { code: invite.code } });
+  const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const seen = async () => (await f.request('/v1/me', { token: b })).value.pair.partner.lastSeenAt;
+  const partner = await liveClient(f.base, b);
+  const clients = [partner];
+  const connect = async () => { const c = await liveClient(f.base, a); clients.push(c); return c; };
+  try {
+    // The app running in the background (connected, not open) is never "seen",
+    // even across reconnects such as network changes or server restarts.
+    let app = await connect();
+    app.send({ type: 'presence', active: false });
+    await wait(150);
+    app.ws.close();
+    await wait(150);
+    app = await connect();
+    app.send({ type: 'presence', active: false });
+    await wait(150);
+    assert.equal(await seen(), null);
+    assert.equal(partner.events.some(e => e.type === 'presence'), false);
+
+    // Opening the app shows Online; leaving it records when they left.
+    const opened = Date.now();
+    app.send({ type: 'presence', active: true });
+    await partner.take(e => e.type === 'presence' && e.online);
+    await wait(100);
+    app.send({ type: 'presence', active: false });
+    const left = Date.now();
+    const offline = await partner.take(e => e.type === 'presence' && !e.online);
+    const lastSeen = await seen();
+    assert.equal(offline.lastSeenAt, lastSeen);
+    assert.ok(lastSeen >= opened && lastSeen <= left + 5, 'last seen is the moment they left');
+
+    // Later background reconnects leave it alone.
+    app.ws.close();
+    await wait(150);
+    app = await connect();
+    app.send({ type: 'presence', active: false });
+    await wait(150);
+    assert.equal(await seen(), lastSeen);
+
+    // If the app disappears without saying goodbye, last seen is its last
+    // heartbeat, not the moment the server noticed the silence.
+    app.send({ type: 'presence', active: true });
+    await partner.take(e => e.type === 'presence' && e.online);
+    const heartbeat = Date.now();
+    const expired = await partner.take(e => e.type === 'presence' && !e.online);
+    assert.ok(Date.now() - heartbeat >= 550, 'the lease ran out');
+    assert.ok(expired.lastSeenAt <= heartbeat + 5, 'last seen is the final heartbeat');
+    assert.equal(await seen(), expired.lastSeenAt);
+  } finally {
+    for (const client of clients) client.ws.terminate();
+  }
+});

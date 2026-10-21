@@ -507,6 +507,21 @@ const _months = [
 String longDate(DateTime date) =>
     '${date.day} ${_months[date.month - 1]} ${date.year}';
 
+/// When the person last had Aida open, as a clock time, e.g.
+/// "Last seen today at 14:05". [seen] and [now] are local times.
+String lastSeenLabel(DateTime seen, DateTime now) {
+  final clock =
+      '${seen.hour.toString().padLeft(2, '0')}:${seen.minute.toString().padLeft(2, '0')}';
+  final today = DateTime(now.year, now.month, now.day);
+  final day = DateTime(seen.year, seen.month, seen.day);
+  final daysAgo = today.difference(day).inHours ~/ 24;
+  if (daysAgo <= 0) return 'Last seen today at $clock';
+  if (daysAgo == 1) return 'Last seen yesterday at $clock';
+  final month = _months[seen.month - 1].substring(0, 3);
+  final year = seen.year == now.year ? '' : ' ${seen.year}';
+  return 'Last seen ${seen.day} $month$year at $clock';
+}
+
 /// How long two people have been connected, counted in calendar days.
 /// The day they connected is Day 1.
 class Together {

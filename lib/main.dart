@@ -44,7 +44,7 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
   );
   static const _preview =
       kDebugMode && bool.fromEnvironment('AIDA_DESIGN_PREVIEW');
-  static const _version = 'Aida 2.3.0';
+  static const _version = 'Aida 2.3.1';
 
   final _nameController = TextEditingController();
   final _inviteController = TextEditingController();
@@ -115,6 +115,9 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // Only an app on screen counts as "seen"; don't assume it at startup.
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    _foreground = lifecycle == null || lifecycle == AppLifecycleState.resumed;
     _messageFocus.addListener(() {
       if (!_messageFocus.hasFocus) _stopTyping();
     });
@@ -371,12 +374,10 @@ class _AidaAppState extends State<AidaApp> with WidgetsBindingObserver {
     if (partner['online'] == true) return 'Online';
     final stamp = partner['lastSeenAt'] as int?;
     if (stamp == null) return 'Offline';
-    final seen = DateTime.fromMillisecondsSinceEpoch(stamp);
-    final age = DateTime.now().difference(seen);
-    if (age.inMinutes < 1) return 'Last seen just now';
-    if (age.inHours < 1) return 'Last seen ${age.inMinutes}m ago';
-    if (age.inHours < 24) return 'Last seen ${age.inHours}h ago';
-    return 'Last seen ${seen.day}/${seen.month}/${seen.year}';
+    return lastSeenLabel(
+      DateTime.fromMillisecondsSinceEpoch(stamp),
+      DateTime.now(),
+    );
   }
 
   Future<void> _registerNotifications() async {
